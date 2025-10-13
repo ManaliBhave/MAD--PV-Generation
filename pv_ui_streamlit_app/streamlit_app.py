@@ -1,0 +1,664 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import pydeck as pdk
+import plotly.express as px
+import plotly.graph_objects as go
+import math
+from streamlit_folium import st_folium
+import folium
+from folium.plugins import Draw
+import uuid
+import os
+from pathlib import Path
+obj_path = r"C:\Users\ManaliBhave\OneDrive - Go Digital Technology Consulting LLP\Documents\main\object"
+os.makedirs(os.path.dirname(r"C:\Users\ManaliBhave\OneDrive - Go Digital Technology Consulting LLP\Documents\main\object"), exist_ok=True)
+
+
+from data_loader import load_state, get_states_and_base, build_paths, resolve_base
+
+from kpi_utils import annualize_monthly, shading_kpis
+
+st.set_page_config(page_title="PV + Shading + Tariff Explorer", layout="wide")
+
+# ---------- helpers ----------
+def _secrets_optional():
+    """Return st.secrets if present; else None (without raising)."""
+    try:
+        return st.secrets
+    except Exception:
+        return None
+
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+def guess_time_col(df: pd.DataFrame):
+    """Heuristic guess for a time column name."""
+    if df is None or df.empty:
+        return None
+    for c in df.columns:
+        lc = str(c).strip().lower()
+        if any(k in lc for k in ("timestamp", "time", "date", "datetime")):
+            return c
+    return None
+
+def parse_ts_column(df: pd.DataFrame, col: str | None):
+    """
+    Try very hard to parse a datetime column and return a tz-naive datetime64 series.
+    Returns None if parsing fails.
+    """
+    if df is None or col is None or col not in df.columns:
+        return None
+
+    s = df[col]
+
+    # Already datetime?
+    if pd.api.types.is_datetime64_any_dtype(s):
+        try:
+            # drop tz if any
+            return s.dt.tz_convert(None)
+        except Exception:
+            try:
+                return s.dt.tz_localize(None)
+            except Exception:
+                return pd.to_datetime(s, errors="coerce")
+
+    # Try strings (trim)
+    s_str = s.astype(str).str.strip().replace({"": np.nan})
+
+    # 1) direct parse, infer format
+    ts = pd.to_datetime(s_str, errors="coerce", utc=False, infer_datetime_format=True)
+    if pd.api.types.is_datetime64_any_dtype(ts) and ts.notna().any():
+        return ts
+
+    # 2) ISO with Z → remove Z and parse as UTC, then make naive
+    ts2 = pd.to_datetime(s_str.str.replace("Z", "", regex=False), errors="coerce", utc=True)
+    if ts2.notna().any():
+        try:
+            return ts2.dt.tz_convert(None)
+        except Exception:
+            return ts2.dt.tz_localize(None)
+
+    # 3) epoch seconds / milliseconds
+    num = pd.to_numeric(s_str, errors="coerce")
+    if num.notna().any():
+        # heuristic threshold for ms vs s
+        median = num.dropna().median()
+        if median > 1e11:
+            ts3 = pd.to_datetime(num, unit="ms", errors="coerce", utc=True)
+        else:
+            ts3 = pd.to_datetime(num, unit="s", errors="coerce", utc=True)
+        if ts3.notna().any():
+            try:
+                return ts3.dt.tz_convert(None)
+            except Exception:
+                return ts3.dt.tz_localize(None)
+
+    return None
+
+# --- geo helpers: meters <-> lat/lon (local flat-earth approximation) ---
+def meters_to_latlon_offsets(lat_deg: float, dx_m: float, dy_m: float):
+    """
+    Convert local-meter offsets to lat/lon deltas at a given latitude.
+    dx_m: +east (meters)
+    dy_m: +north (meters)
+    """
+    lat_rad = math.radians(lat_deg)
+    dlat = dy_m / 111_320.0
+    dlon = dx_m / (111_320.0 * math.cos(lat_rad) if abs(math.cos(lat_rad)) > 1e-6 else 1e-6)
+    return dlat, dlon
+
+def rotate_xy_clockwise(x_m: float, y_m: float, azimuth_deg: float):
+    """
+    Rotate (x=+east, y=+north) clockwise by azimuth degrees.
+    PV azimuth: 0°=North, 90°=East, 180°=South, 270°=West (standard PV convention).
+    """
+    th = math.radians(azimuth_deg)
+    xr = x_m * math.cos(th) + y_m * math.sin(th)
+    yr = -x_m * math.sin(th) + y_m * math.cos(th)
+    return xr, yr
+
+def make_pv_polygon(lat_center: float, lon_center: float, length_m: float = 10.0, width_m: float = 5.0, azimuth_deg: float = 180.0):
+    """
+    Build a rectangle (length along the module rows; width across rows) centered on (lat,lon),
+    rotated by azimuth_deg, returned as a closed ring of [lon, lat] pairs for pydeck PolygonLayer.
+    """
+    # Corner offsets before rotation: y=+north, x=+east
+    L = length_m / 2.0
+    W = width_m / 2.0
+    corners_xy = [(-W, -L), ( W, -L), ( W,  L), (-W,  L)]  # CCW ring
+
+    ring = []
+    for (x, y) in corners_xy:
+        xr, yr = rotate_xy_clockwise(x, y, azimuth_deg)
+        dlat, dlon = meters_to_latlon_offsets(lat_center, xr, yr)
+        ring.append([lon_center + dlon, lat_center + dlat])
+
+    # close the polygon
+    ring.append(ring[0])
+    return ring
+# -----------------------------
+
+# Fixed PV centers per site (lat, lon, tz optional)
+SITE_CENTERS = {
+    "california":        (37.390026, -122.08123,  "America/Los_Angeles"),
+    "north_carolinas":   (35.759573,  -79.019300, "America/New_York"),
+    "texas":             (29.760077,  -95.370111, "America/Chicago"),
+    "north_dakota":      (46.539175, -102.868223, "America/Chicago"),
+    "colorado":          (39.306108, -102.269356, "America/Denver"),
+    "michigan":          (45.421402,  -83.81833,  "America/Detroit"),
+    "maine":             (44.952297,  -67.660831, "America/New_York"),
+    "washington":        (47.606139, -122.332848, "America/Los_Angeles"),
+    "missouri":          (36.083959,  -89.829251, "America/Chicago"),
+    "nevada":            (41.947679, -116.098709, "America/Los_Angeles"),
+    "florida":           (25.761680,  -80.191179, "America/New_York"),
+}
+
+# Discover sites + base
+STATES, DATA_BASE = get_states_and_base(_secrets_optional())
+if not STATES:
+    st.error("No datasets found. Set PV_DATA_BASE env var or place this app next to your 'main' data folder.")
+    st.stop()
+
+# Sidebar controls
+st.sidebar.title("Controls")
+default_idx = STATES.index("texas") if "texas" in STATES else 0
+state = st.sidebar.selectbox("Site / State", STATES, index=min(default_idx, len(STATES)-1))
+show_map = st.sidebar.checkbox("Show Map", value=True)
+show_uncertainty = st.sidebar.checkbox("Show Uncertainty Bands (if available)", value=False)
+
+# Load data
+data, debug = load_state(state, _secrets_optional())
+
+# Normalize columns
+for k in ("monthly_net", "hourly_net", "pv_generation", "objects", "shading"):
+    if data.get(k) is not None:
+        data[k] = normalize_cols(data[k])
+
+df_month = data["monthly_net"]
+df_hour  = data["hourly_net"]
+df_pv    = data["pv_generation"]
+df_shad  = data["shading"]
+
+# --- session-scoped objects df per state (so edits survive reruns) ---
+objs_session_key = f"objs_df_{state}"
+dirty_session_key = f"objs_dirty_{state}"
+
+def _normalize_objects_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["object_id","object_type","latitude","longitude","height_m","shading_intensity"])
+    df = df.copy()
+    # normalize columns
+    for col in ["latitude","longitude","height_m","shading_intensity"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "object_id" in df.columns:
+        df["object_id"] = df["object_id"].astype(str)
+    return df
+
+# 1) prime session with CSV contents the first time (or if missing)
+if objs_session_key not in st.session_state:
+    st.session_state[objs_session_key] = _normalize_objects_df(data["objects"])
+if dirty_session_key not in st.session_state:
+    st.session_state[dirty_session_key] = False
+
+# 2) use the session copy everywhere below
+df_objs = st.session_state[objs_session_key]
+
+
+with st.sidebar.expander("Data paths (debug)", expanded=False):
+    st.write(f"Base: {debug['base']}")
+    st.json(debug["exists"])
+
+# ----- Advanced: choose timestamp columns if auto-detect fails -----
+with st.sidebar.expander("Advanced • Timestamp columns", expanded=False):
+    mon_guess = guess_time_col(df_month) if df_month is not None else None
+    hr_guess  = guess_time_col(df_hour) if df_hour is not None else None
+    sh_guess  = guess_time_col(df_shad) if df_shad is not None else None
+
+    mon_col = st.selectbox(
+        "Monthly time column",
+        options=(list(df_month.columns) if df_month is not None else []),
+        index=(list(df_month.columns).index(mon_guess) if (df_month is not None and mon_guess in df_month.columns) else 0) if (df_month is not None and len(df_month.columns)>0) else None,
+        key="mon_ts_col"
+    ) if df_month is not None else None
+
+    hr_col = st.selectbox(
+        "Hourly time column",
+        options=(list(df_hour.columns) if df_hour is not None else []),
+        index=(list(df_hour.columns).index(hr_guess) if (df_hour is not None and hr_guess in df_hour.columns) else 0) if (df_hour is not None and len(df_hour.columns)>0) else None,
+        key="hr_ts_col"
+    ) if df_hour is not None else None
+
+    sh_col = st.selectbox(
+        "Shading time column",
+        options=(list(df_shad.columns) if df_shad is not None else []),
+        index=(list(df_shad.columns).index(sh_guess) if (df_shad is not None and sh_guess in df_shad.columns) else 0) if (df_shad is not None and len(df_shad.columns)>0) else None,
+        key="sh_ts_col"
+    ) if df_shad is not None else None
+
+# Parse timestamps (using chosen columns when available)
+ts_month = parse_ts_column(df_month, mon_col) if df_month is not None else None
+ts_hour  = parse_ts_column(df_hour,  hr_col)  if df_hour  is not None else None
+ts_shad  = parse_ts_column(df_shad,  sh_col)  if df_shad  is not None else None
+
+# ---------- KPI header ----------
+ak = annualize_monthly(df_month)
+sk = shading_kpis(df_shad)
+
+def make_bill_waterfall(baseline: float, buy: float, sell: float, net: float) -> go.Figure:
+    """
+    Build a Waterfall chart:
+      Baseline (no PV)  ->  Energy bought  ->  Export credit  ->  Net bill
+    """
+    # Ensure numbers (avoid None/NaN)
+    vals = [baseline or 0.0, -(buy or 0.0), -(sell or 0.0), net or 0.0]
+    measures = ["absolute", "relative", "relative", "total"]  # last bar is total
+
+    fig = go.Figure(go.Waterfall(
+        name="Bill",
+        orientation="v",
+        measure=measures,
+        x=["Baseline (no PV)", "Energy bought", "Export credit", "Net bill"],
+        y=vals,
+        connector={"line": {"dash": "dot", "width": 1}},
+        text=[f"{v:,.0f}" for v in vals],
+        textposition="outside"
+    ))
+    fig.update_layout(
+        title="Annual Bill Breakdown (Estimated)",
+        showlegend=False,
+        margin=dict(l=10, r=10, t=50, b=10)
+    )
+    return fig
+
+# Fallback KPIs from hourly if monthly is missing
+if (not ak) and (df_hour is not None) and (len(df_hour) > 0):
+    load_kwh   = float(pd.to_numeric(df_hour.get("Load_E_kWh", df_hour.get("Load_kW", 0)), errors="coerce").fillna(0).sum())
+    pv_kwh     = float(pd.to_numeric(df_hour.get("PV_E_kWh",   df_hour.get("PV_P_kW", 0)), errors="coerce").fillna(0).sum())
+    export_kwh = float(pd.to_numeric(df_hour.get("Export_kWh", 0), errors="coerce").fillna(0).sum())
+    self_consumed = max(pv_kwh - export_kwh, 0.0)
+    ak = {
+        "annual_pv_kwh": pv_kwh,
+        "annual_load_kwh": load_kwh,
+        "annual_import_kwh": float(pd.to_numeric(df_hour.get("Import_kWh", 0), errors="coerce").fillna(0).sum()),
+        "annual_export_kwh": export_kwh,
+        "net_bill": 0.0,
+        "baseline_bill_est": 0.0,
+        "savings_est": 0.0,
+        "self_consumption_pct": (self_consumed / pv_kwh * 100) if pv_kwh > 0 else 0.0,
+        "self_sufficiency_pct": (self_consumed / load_kwh * 100) if load_kwh > 0 else 0.0,
+        "avg_buy_rate": 0.0,
+    }
+
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("Annual PV (kWh)", f"{ak.get('annual_pv_kwh',0):,.0f}")
+col2.metric("Annual Load (kWh)", f"{ak.get('annual_load_kwh',0):,.0f}")
+col3.metric("Self-consumption (%)", f"{ak.get('self_consumption_pct',0):.1f}%")
+col4.metric("Savings (est)", f"${ak.get('savings_est',0):,.0f}")
+col5.metric("Avg Shading Loss", (f"{sk.get('avg_shading_loss_pct',0):.1f}%" if sk.get("avg_shading_loss_pct") is not None else "—"))
+
+st.markdown("---")
+
+# ---------- Tabs ----------
+tab_overview, tab_map, tab_energy, tab_bill, tab_exports, tab_data = st.tabs(
+    ["Overview", "Map & Shading", "Energy Profiles", "Billing", "Export/Import", "Data"]
+)
+
+# Overview
+with tab_overview:
+    st.subheader(f"Summary for {state.title()}")
+    if df_month is not None and not df_month.empty:
+        m = df_month.copy()
+        if ts_month is None:
+            st.warning("Could not parse a timestamp column in monthly data. Choose it in the sidebar (Advanced • Timestamp columns).")
+        else:
+            m["month"] = ts_month.dt.strftime("%Y-%m")
+            ycols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in m.columns]
+            if ycols:
+                fig = px.bar(m, x="month", y=ycols, barmode="group", title="Monthly Energy")
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Waterfall (estimated)
+            buy  = pd.to_numeric(m.get("Buy_$", 0), errors="coerce").fillna(0).sum()
+            sell = pd.to_numeric(m.get("Sell_$", 0), errors="coerce").fillna(0).sum()
+            net  = pd.to_numeric(m.get("NetBill_$", 0), errors="coerce").fillna(0).sum()
+            baseline = ak.get("baseline_bill_est", 0.0)
+            wf = pd.DataFrame({
+                "stage": ["Baseline (no PV)", "Energy bought", "Export credit", "Net bill"],
+                "value": [baseline, -buy, -sell, net]
+            })
+            figw = make_bill_waterfall(baseline, buy, sell, net)
+            st.plotly_chart(figw, use_container_width=True) 
+
+    else:
+        st.info("Monthly net metering file not found for this state.")
+
+# Map & Shading
+with tab_map:
+    st.subheader("PV Site & Shading Objects")
+
+    # PV center by state
+    if state in SITE_CENTERS:
+        center_lat, center_lon, _tz = SITE_CENTERS[state]
+    else:
+        if not df_objs.empty:
+            center_lat = df_objs["latitude"].dropna().mean()
+            center_lon = df_objs["longitude"].dropna().mean()
+        else:
+            center_lat, center_lon = 37.3894, -122.0839
+
+    # PV footprint controls
+    with st.expander("PV array settings", expanded=False):
+        colA, colB, colC = st.columns(3)
+        pv_length_m = colA.number_input("Array length (m)", min_value=2.0, max_value=200.0, value=12.0, step=1.0)
+        pv_width_m  = colB.number_input("Array width (m)",  min_value=1.0, max_value=200.0, value=6.0,  step=1.0)
+        pv_az_deg   = colC.number_input("Azimuth (°)", min_value=0.0, max_value=359.0, value=180.0, step=1.0,
+                                        help="0=N, 90=E, 180=S, 270=W")
+
+    pv_ring = make_pv_polygon(center_lat, center_lon, length_m=pv_length_m, width_m=pv_width_m, azimuth_deg=pv_az_deg)
+
+    # mode switch
+    mode = st.radio("Mode", ["View", "Edit / Add"], horizontal=True)
+
+    # Badge for unsaved changes
+    if st.session_state[dirty_session_key]:
+        st.markdown("<span style='background:#fff3cd;color:#664d03;padding:4px 8px;border:1px solid #ffe69c;border-radius:6px;'>Unsaved changes</span>", unsafe_allow_html=True)
+
+    if mode == "View":
+        # -------- VIEW (pydeck) --------
+        layers = []
+        pv_feature = [{
+            "type": "Feature",
+            "properties": {"name": "PV Array", "length_m": pv_length_m, "width_m": pv_width_m, "azimuth_deg": pv_az_deg},
+            "geometry": {"type": "Polygon", "coordinates": [pv_ring]},
+        }]
+        layers.append(
+            pdk.Layer(
+                "PolygonLayer",
+                pv_feature,
+                get_polygon="geometry.coordinates[0]",
+                stroked=True, filled=True,
+                get_line_color=[0,180,255], line_width_min_pixels=2,
+                get_fill_color=[0,180,255,60], pickable=True,
+            )
+        )
+        if not df_objs.empty and {"latitude","longitude"}.issubset(df_objs.columns):
+            dfv = df_objs.copy()
+            type_colors = {"Pole":[255,180,0], "Building":[255,99,132], "Tree":[50,205,50]}
+            dfv["__fill__"] = dfv.get("object_type", pd.Series(index=dfv.index)).map(type_colors)
+            dfv["__fill__"] = dfv["__fill__"].apply(lambda v: v if isinstance(v, (list, tuple, np.ndarray)) else [200,200,200])
+            r = pd.to_numeric(dfv.get("height_m", 3.0), errors="coerce").fillna(3.0).clip(1, 20)
+            dfv["__radius__"] = (r * 1.0).astype(float)
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer", dfv,
+                    get_position=["longitude","latitude"], radius_units="meters",
+                    get_radius="__radius__", get_fill_color="__fill__",
+                    get_line_color=[0,0,0,160], line_width_min_pixels=1, pickable=True,
+                )
+            )
+        deck = pdk.Deck(
+            initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=18, pitch=45),
+            layers=layers,
+            map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+            tooltip={"html":"<b>{name}</b><br/>Type:{object_type}<br/>Height:{height_m}m"}
+        )
+        st.pydeck_chart(deck)
+
+        # legend
+        legend_items = [("PV Array","#00B4FF"), ("Pole","#FFB400"), ("Building","#FF6384"), ("Tree","#32CD32")]
+        legend_html = """
+        <style>.legend-box{display:flex;gap:10px;background:rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.2);
+        padding:10px 12px;border-radius:8px;width:fit-content;margin-top:8px;}
+        .legend-item{display:flex;align-items:center;gap:8px;color:#fff;font-size:0.9rem;}
+        .legend-swatch{width:14px;height:14px;border-radius:3px;border:1px solid rgba(255,255,255,0.6);}</style>
+        <div class="legend-box">%s</div>
+        """ % ("".join(f'<div class="legend-item"><span class="legend-swatch" style="background:{c}"></span>{n}</div>' for n,c in legend_items))
+        st.markdown(legend_html, unsafe_allow_html=True)
+
+    else:
+        # -------- EDIT / ADD (click-to-add/move/delete; session-backed) --------
+        from streamlit_folium import st_folium
+        import folium
+        import uuid
+
+        fmap = folium.Map(location=[center_lat, center_lon], zoom_start=19, tiles="CartoDB positron")
+        folium.Polygon(
+            locations=[[lat, lon] for lon, lat in pv_ring],
+            color="#00B4FF", weight=2, fill=True, fill_opacity=0.25, tooltip="PV Array"
+        ).add_to(fmap)
+
+        # render current objects as plain markers
+        if not df_objs.empty:
+            for _, row in df_objs.iterrows():
+                oid = str(row.get("object_id", ""))
+                ot  = str(row.get("object_type", "Unknown"))
+                lat = float(row.get("latitude", center_lat))
+                lon = float(row.get("longitude", center_lon))
+                folium.Marker(
+                    location=[lat, lon],
+                    tooltip=f"{ot} ({oid})" if oid else ot,
+                    popup=folium.Popup(html=f"{oid}" if oid else ot, max_width=200),
+                    icon=folium.Icon(color="blue", icon="info-sign")
+                ).add_to(fmap)
+
+        fol_ret = st_folium(fmap, height=520, width=None, returned_objects=["last_clicked"], key=f"folium_click_{state}")
+        clicked = (fol_ret or {}).get("last_clicked")
+
+        st.markdown("#### Edit or add objects")
+        c1, c2, c3 = st.columns([1,1,1])
+
+        # ADD
+        with c1.expander("Add new object", expanded=False):
+            if clicked:
+                st.info(f"Clicked lat/lon: {clicked['lat']:.7f}, {clicked['lng']:.7f}")
+            new_oid = st.text_input("Object ID", value=f"OBJ_{uuid.uuid4().hex[:6].upper()}")
+            new_type = st.selectbox("Type", ["Pole", "Building", "Tree", "Other"], index=0)
+            new_height = st.number_input("Height (m)", min_value=0.0, value=3.0, step=0.5)
+            new_intensity = st.slider("Shading intensity (0-1)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
+            new_lat = st.number_input("Latitude", value=(clicked["lat"] if clicked else center_lat), format="%.7f")
+            new_lon = st.number_input("Longitude", value=(clicked["lng"] if clicked else center_lon), format="%.7f")
+            if st.button("Add object", key="btn_add_obj"):
+                new_row = {
+                    "object_id": str(new_oid),
+                    "object_type": new_type,
+                    "latitude": float(new_lat),
+                    "longitude": float(new_lon),
+                    "height_m": float(new_height),
+                    "shading_intensity": float(new_intensity),
+                }
+                st.session_state[objs_session_key] = pd.concat(
+                    [df_objs, pd.DataFrame([new_row])], ignore_index=True
+                )
+                st.session_state[dirty_session_key] = True
+                st.success("Added in session. Use 'Save objects to CSV' to persist.")
+                st.rerun()
+
+        # MOVE
+        with c2.expander("Move existing object", expanded=False):
+            if df_objs.empty or "object_id" not in df_objs.columns:
+                st.info("No objects loaded.")
+            else:
+                sel_oid = st.selectbox("Select object", options=sorted(map(str, df_objs["object_id"])))
+                row = df_objs[df_objs["object_id"].astype(str) == sel_oid].iloc[0]
+                st.write(f"Current: {float(row['latitude']):.7f}, {float(row['longitude']):.7f}")
+                if clicked:
+                    st.info(f"Clicked lat/lon: {clicked['lat']:.7f}, {clicked['lng']:.7f}")
+                new_lat2 = st.number_input("New latitude", value=float(row["latitude"]), format="%.7f", key="mv_lat")
+                new_lon2 = st.number_input("New longitude", value=float(row["longitude"]), format="%.7f", key="mv_lon")
+                if st.button("Move object here", key="btn_move_obj"):
+                    df2 = df_objs.copy()
+                    idx = df2.index[df2["object_id"].astype(str) == sel_oid][0]
+                    df2.at[idx, "latitude"]  = float(new_lat2)
+                    df2.at[idx, "longitude"] = float(new_lon2)
+                    st.session_state[objs_session_key] = df2
+                    st.session_state[dirty_session_key] = True
+                    st.success("Moved in session. Use 'Save objects to CSV' to persist.")
+                    st.rerun()
+
+        # DELETE
+        with c3.expander("Delete object", expanded=False):
+            if df_objs.empty or "object_id" not in df_objs.columns:
+                st.info("No objects loaded.")
+            else:
+                del_oid = st.selectbox("Select object to delete", options=sorted(map(str, df_objs["object_id"])), key="del_oid")
+                if st.button("Delete selected object", key="btn_del_obj"):
+                    df2 = df_objs[df_objs["object_id"].astype(str) != del_oid].copy()
+                    st.session_state[objs_session_key] = df2
+                    st.session_state[dirty_session_key] = True
+                    st.success(f"Deleted '{del_oid}' in session. Use 'Save objects to CSV' to persist.")
+                    st.rerun()
+
+        # SAVE / RELOAD
+        colL, colR = st.columns([1,1])
+
+        if colL.button("Save objects to CSV (persist)"):
+            base = resolve_base(_secrets_optional())
+            obj_path = build_paths(base, state)["objects"]
+
+            # Ensure folder exists (scoped here, where obj_path is defined)
+            Path(obj_path).parent.mkdir(parents=True, exist_ok=True)
+
+            # Write atomically
+            tmp_path = str(obj_path) + ".tmp"
+            st.session_state[objs_session_key].to_csv(tmp_path, index=False)
+
+            import os
+            if os.path.exists(obj_path):
+                os.replace(tmp_path, obj_path)
+            else:
+                os.rename(tmp_path, obj_path)
+
+            st.session_state[dirty_session_key] = False
+            st.success(f"Saved objects to {obj_path}")
+
+        if colR.button("Reload objects from CSV"):
+            base = resolve_base(_secrets_optional())
+            obj_path = build_paths(base, state)["objects"]
+            try:
+                df_disk = pd.read_csv(obj_path)
+            except Exception:
+                df_disk = pd.DataFrame(columns=["object_id","object_type","latitude","longitude","height_m","shading_intensity"])
+
+            # Normalize and store back into session
+            def _normalize_objects_df(df):
+                if df is None or df.empty:
+                    return pd.DataFrame(columns=["object_id","object_type","latitude","longitude","height_m","shading_intensity"])
+                df = df.copy()
+                for col in ["latitude","longitude","height_m","shading_intensity"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                if "object_id" in df.columns:
+                    df["object_id"] = df["object_id"].astype(str)
+                return df
+
+            st.session_state[objs_session_key] = _normalize_objects_df(df_disk)
+            st.session_state[dirty_session_key] = False
+            st.info("Reloaded from CSV.")
+            st.rerun()
+
+
+
+# Energy Profiles
+with tab_energy:
+    st.subheader("Energy Production & Load")
+    if df_hour is not None and not df_hour.empty:
+        h = df_hour.copy()
+        if ts_hour is None:
+            st.warning("Could not parse a timestamp column in hourly data. Choose it in the sidebar (Advanced • Timestamp columns).")
+        else:
+            h["__ts__"] = ts_hour
+            ycols = [c for c in ["PV_P_kW", "Load_kW"] if c in h.columns]
+            if ycols:
+                fig = px.line(h, x="__ts__", y=ycols, title="Power (kW)")
+                st.plotly_chart(fig, use_container_width=True)
+
+            # 8760 pivot
+            value_col = "PV_E_kWh" if "PV_E_kWh" in h.columns else ("PV_P_kW" if "PV_P_kW" in h.columns else None)
+            if value_col:
+                pv = h[["__ts__", value_col]].copy()
+                pv["date"] = pv["__ts__"].dt.date
+                pv["hour"] = pv["__ts__"].dt.hour
+                heat = pv.pivot_table(index="hour", columns="date", values=value_col, aggfunc="sum")
+                st.dataframe(heat)
+                st.caption("Tip: replace with a heatmap chart if desired.")
+            else:
+                st.info("PV column not found for heatmap (looked for PV_E_kWh / PV_P_kW).")
+    else:
+        st.info("Hourly net file not found for this state.")
+
+# Billing
+with tab_bill:
+    st.subheader("Billing & Savings")
+    if df_month is not None and not df_month.empty:
+        m = df_month.copy()
+        if ts_month is None:
+            st.warning("Could not parse a timestamp column in monthly data. Choose it in the sidebar (Advanced • Timestamp columns).")
+        else:
+            m["month"] = ts_month.dt.strftime("%Y-%m")
+
+            # Monthly costs bars
+            cols = [c for c in ["Buy_$", "Sell_$", "NetBill_$"] if c in m.columns]
+            if cols:
+                fig = px.bar(m, x="month", y=cols, barmode="group", title="Monthly Costs")
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Cost & energy table (only columns that exist)
+            table_cols = ["month"]
+            table_cols += [c for c in ["Import_kWh", "Export_kWh", "Buy_$", "Sell_$", "NetBill_$"] if c in m.columns]
+            st.dataframe(m[table_cols])
+    else:
+        st.info("Monthly net metering file not found for this state.")
+
+# Export / Import
+with tab_exports:
+    st.subheader("Import vs Export (Hourly)")
+    if df_hour is not None and not df_hour.empty:
+        h = df_hour.copy()
+        if ts_hour is None:
+            st.warning("Could not parse a timestamp column in hourly data. Choose it in the sidebar (Advanced • Timestamp columns).")
+        else:
+            h["__ts__"] = ts_hour
+            ycols = [c for c in ["Import_kWh", "Export_kWh"] if c in h.columns]
+            if ycols:
+                fig = px.area(h, x="__ts__", y=ycols, title="Import/Export Energy (kWh)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Hourly file lacks Import_kWh / Export_kWh columns.")
+    else:
+        st.info("Hourly net file not found for this state.")
+
+# Data tab (samples for debugging)
+with tab_data:
+    st.subheader("Raw Data Snapshots")
+    if df_pv is not None and not df_pv.empty:
+        st.write("PV Generation (sample)")
+        st.dataframe(df_pv.head(200))
+    else:
+        st.caption("No PV generation csv found or it is empty.")
+
+    if df_shad is not None and not df_shad.empty:
+        st.write("Shading Result (sample)")
+        st.dataframe(df_shad.head(200))
+    else:
+        st.caption("No shading result csv found or it is empty.")
+
+    if df_objs is not None and not df_objs.empty:
+        st.write("Objects")
+        st.dataframe(df_objs)
+    else:
+        st.caption("No object csv found or it is empty.")
+
+    if df_month is not None and not df_month.empty:
+        st.write("Monthly Net Metering")
+        st.dataframe(df_month)
+    else:
+        st.caption("No monthly net csv found or it is empty.")
+
+    if df_hour is not None and not df_hour.empty:
+        st.write("Hourly Net Metering (sample)")
+        st.dataframe(df_hour.head(500))
+    else:
+        st.caption("No hourly net csv found or it is empty.")

@@ -1,40 +1,44 @@
-import streamlit as st
-import pandas as pd
+import os
+import sys
+import time
+import math
+import uuid
+import subprocess
+from pathlib import Path
+
 import numpy as np
-import pydeck as pdk
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import math
+import pydeck as pdk
+import streamlit as st
 from streamlit_folium import st_folium
 import folium
-from folium.plugins import Draw
-import uuid
-import os
-from pathlib import Path
-obj_path = r"C:\Users\ManaliBhave\OneDrive - Go Digital Technology Consulting LLP\Documents\main\object"
-os.makedirs(os.path.dirname(r"C:\Users\ManaliBhave\OneDrive - Go Digital Technology Consulting LLP\Documents\main\object"), exist_ok=True)
-
 
 from data_loader import load_state, get_states_and_base, build_paths, resolve_base
-
 from kpi_utils import annualize_monthly, shading_kpis
 
+# ---------------------------------------------------------------------
+# Streamlit Page
+# ---------------------------------------------------------------------
 st.set_page_config(page_title="PV + Shading + Tariff Explorer", layout="wide")
 
-# ---------- helpers ----------
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 def _secrets_optional():
-    """Return st.secrets if present; else None (without raising)."""
     try:
         return st.secrets
     except Exception:
         return None
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return df
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 def guess_time_col(df: pd.DataFrame):
-    """Heuristic guess for a time column name."""
     if df is None or df.empty:
         return None
     for c in df.columns:
@@ -44,19 +48,13 @@ def guess_time_col(df: pd.DataFrame):
     return None
 
 def parse_ts_column(df: pd.DataFrame, col: str | None):
-    """
-    Try very hard to parse a datetime column and return a tz-naive datetime64 series.
-    Returns None if parsing fails.
-    """
     if df is None or col is None or col not in df.columns:
         return None
-
     s = df[col]
 
     # Already datetime?
     if pd.api.types.is_datetime64_any_dtype(s):
         try:
-            # drop tz if any
             return s.dt.tz_convert(None)
         except Exception:
             try:
@@ -64,15 +62,12 @@ def parse_ts_column(df: pd.DataFrame, col: str | None):
             except Exception:
                 return pd.to_datetime(s, errors="coerce")
 
-    # Try strings (trim)
     s_str = s.astype(str).str.strip().replace({"": np.nan})
 
-    # 1) direct parse, infer format
     ts = pd.to_datetime(s_str, errors="coerce", utc=False, infer_datetime_format=True)
     if pd.api.types.is_datetime64_any_dtype(ts) and ts.notna().any():
         return ts
 
-    # 2) ISO with Z → remove Z and parse as UTC, then make naive
     ts2 = pd.to_datetime(s_str.str.replace("Z", "", regex=False), errors="coerce", utc=True)
     if ts2.notna().any():
         try:
@@ -80,10 +75,8 @@ def parse_ts_column(df: pd.DataFrame, col: str | None):
         except Exception:
             return ts2.dt.tz_localize(None)
 
-    # 3) epoch seconds / milliseconds
     num = pd.to_numeric(s_str, errors="coerce")
     if num.notna().any():
-        # heuristic threshold for ms vs s
         median = num.dropna().median()
         if median > 1e11:
             ts3 = pd.to_datetime(num, unit="ms", errors="coerce", utc=True)
@@ -94,53 +87,36 @@ def parse_ts_column(df: pd.DataFrame, col: str | None):
                 return ts3.dt.tz_convert(None)
             except Exception:
                 return ts3.dt.tz_localize(None)
-
     return None
 
-# --- geo helpers: meters <-> lat/lon (local flat-earth approximation) ---
+# --- geo helpers ------------------------------------------------------
 def meters_to_latlon_offsets(lat_deg: float, dx_m: float, dy_m: float):
-    """
-    Convert local-meter offsets to lat/lon deltas at a given latitude.
-    dx_m: +east (meters)
-    dy_m: +north (meters)
-    """
     lat_rad = math.radians(lat_deg)
     dlat = dy_m / 111_320.0
     dlon = dx_m / (111_320.0 * math.cos(lat_rad) if abs(math.cos(lat_rad)) > 1e-6 else 1e-6)
     return dlat, dlon
 
 def rotate_xy_clockwise(x_m: float, y_m: float, azimuth_deg: float):
-    """
-    Rotate (x=+east, y=+north) clockwise by azimuth degrees.
-    PV azimuth: 0°=North, 90°=East, 180°=South, 270°=West (standard PV convention).
-    """
     th = math.radians(azimuth_deg)
     xr = x_m * math.cos(th) + y_m * math.sin(th)
     yr = -x_m * math.sin(th) + y_m * math.cos(th)
     return xr, yr
 
 def make_pv_polygon(lat_center: float, lon_center: float, length_m: float = 10.0, width_m: float = 5.0, azimuth_deg: float = 180.0):
-    """
-    Build a rectangle (length along the module rows; width across rows) centered on (lat,lon),
-    rotated by azimuth_deg, returned as a closed ring of [lon, lat] pairs for pydeck PolygonLayer.
-    """
-    # Corner offsets before rotation: y=+north, x=+east
     L = length_m / 2.0
     W = width_m / 2.0
-    corners_xy = [(-W, -L), ( W, -L), ( W,  L), (-W,  L)]  # CCW ring
-
+    corners_xy = [(-W, -L), ( W, -L), ( W,  L), (-W,  L)]
     ring = []
     for (x, y) in corners_xy:
         xr, yr = rotate_xy_clockwise(x, y, azimuth_deg)
         dlat, dlon = meters_to_latlon_offsets(lat_center, xr, yr)
         ring.append([lon_center + dlon, lat_center + dlat])
-
-    # close the polygon
     ring.append(ring[0])
     return ring
-# -----------------------------
 
-# Fixed PV centers per site (lat, lon, tz optional)
+# ---------------------------------------------------------------------
+# PV centers per site (lat, lon, tz optional)
+# ---------------------------------------------------------------------
 SITE_CENTERS = {
     "california":        (37.390026, -122.08123,  "America/Los_Angeles"),
     "north_carolinas":   (35.759573,  -79.019300, "America/New_York"),
@@ -155,7 +131,137 @@ SITE_CENTERS = {
     "florida":           (25.761680,  -80.191179, "America/New_York"),
 }
 
-# Discover sites + base
+# ---------------------------------------------------------------------
+# Session keys (per state)
+# ---------------------------------------------------------------------
+def _objs_key(state):        return f"objs_df_{state}"
+def _objs_dirty_key(state):  return f"objs_dirty_{state}"
+def _obj_tmp_key(state):     return f"obj_tmp_path_{state}"
+def _shad_df_key(state):     return f"shading_df_session_{state}"
+def _shad_path_key(state):   return f"shading_tmp_path_{state}"
+def _pv_df_key(state):       return f"pv_df_session_{state}"
+def _pv_path_key(state):     return f"pv_tmp_path_{state}"
+
+def _normalize_objects_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["object_id","object_type","latitude","longitude","height_m","shading_intensity"])
+    df = df.copy()
+    for col in ["latitude","longitude","height_m","shading_intensity"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "object_id" in df.columns:
+        df["object_id"] = df["object_id"].astype(str)
+    return df
+
+def _find_shading_script() -> Path | None:
+    here = Path(__file__).resolve().parent
+    cands = [
+        here / "shading.py",
+        here.parent / "shading.py",
+        here.parent / "main" / "shading.py",
+        here.parent.parent / "shading.py",
+    ]
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+# ---- robust runner: returns actual shading + (optional) pv file it finds ----
+def run_shading_for_state(state: str, base_dir: Path, objects_csv: Path, pv_csv: Path, out_csv: Path):
+    """
+    Try multiple CLI patterns. If expected out_csv isn't found, search likely dirs.
+    Return: (ok: bool, message: str, shading_path: Path|None, pv_path: Path|None)
+    """
+    script = _find_shading_script()
+    if script is None:
+        return False, "shading.py not found. Place it next to this app or at the repo root.", None, None
+
+    out_csv = Path(out_csv).resolve()
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    search_dirs = [
+        out_csv.parent,
+        script.parent,
+        Path(base_dir) / "shading",
+        Path(base_dir) / "pv_generation",
+        Path(base_dir),
+    ]
+
+    attempts = [
+        [sys.executable, str(script), "--state", state, "--objects", str(objects_csv), "--pv", str(pv_csv), "--out", str(out_csv)],
+        [sys.executable, str(script), "--base", str(base_dir), "--state", state, "--out", str(out_csv)],
+    ]
+
+    def _find_outputs(since_ts: float):
+        cand_sh, cand_pv = [], []
+        for d in search_dirs:
+            if not d.exists():
+                continue
+            for p in d.glob("*.csv"):
+                try:
+                    if p.stat().st_mtime >= since_ts - 1:
+                        name = p.name.lower()
+                        if state.lower() in name:
+                            score = 0
+                            if "session" in name: score += 3
+                            if "result"  in name: score += 2
+                            if "shade"   in name or "shad" in name: score += 2
+                            if "pv"      in name: score += 1
+                            tup = (p.stat().st_mtime, score, p)
+                            if any(k in name for k in ["shad", "shade", "result"]) and "pv_generation" not in name:
+                                cand_sh.append(tup)
+                            if any(k in name for k in ["pv", "pv_gen", "pv_generation"]):
+                                cand_pv.append(tup)
+                except Exception:
+                    pass
+
+        def _pick(cands):
+            if not cands: return None
+            cands.sort(key=lambda t: (t[1], t[0]), reverse=True)
+            return cands[0][2]
+
+        return _pick(cand_sh), _pick(cand_pv)
+
+    tried = []
+    start_all = time.time()
+    for args in attempts:
+        start = time.time()
+        try:
+            cp = subprocess.run(args, capture_output=True, text=True, timeout=900, cwd=str(script.parent))
+            dur = time.time() - start
+            tried.append(f"TRIED: {' '.join(args)}\n -> exit {cp.returncode} in {dur:.1f}s\nSTDERR:\n{cp.stderr or '(empty)'}\nSTDOUT:\n{cp.stdout or '(empty)'}")
+            if cp.returncode == 0:
+                if out_csv.exists():
+                    sh_found, pv_found = out_csv, None
+                    _, pv_found = _find_outputs(start)
+                    return True, f"shading.py OK in {dur:.1f}s (wrote expected shading).", sh_found, pv_found
+                sh_found, pv_found = _find_outputs(start)
+                if sh_found or pv_found:
+                    return True, f"shading.py OK in {dur:.1f}s (found outputs).", sh_found, pv_found
+        except Exception as e:
+            tried.append(f"TRIED: {' '.join(args)}\n -> Exception: {e}")
+
+    sh_found, pv_found = _find_outputs(start_all)
+    if sh_found or pv_found:
+        return True, "shading.py appears to have produced files (found via search).", sh_found, pv_found
+
+    return False, "All CLI patterns failed or no output CSV was created.\n\n" + "\n\n".join(tried), None, None
+
+def make_bill_waterfall(baseline: float, buy: float, sell: float, net: float) -> go.Figure:
+    vals = [baseline or 0.0, -(buy or 0.0), -(sell or 0.0), net or 0.0]
+    measures = ["absolute", "relative", "relative", "total"]
+    fig = go.Figure(go.Waterfall(
+        name="Bill", orientation="v", measure=measures,
+        x=["Baseline (no PV)", "Energy bought", "Export credit", "Net bill"],
+        y=vals, connector={"line": {"dash": "dot", "width": 1}},
+        text=[f"{v:,.0f}" for v in vals], textposition="outside"
+    ))
+    fig.update_layout(title="Annual Bill Breakdown (Estimated)", showlegend=False, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+# ---------------------------------------------------------------------
+# Discover + load data
+# ---------------------------------------------------------------------
 STATES, DATA_BASE = get_states_and_base(_secrets_optional())
 if not STATES:
     st.error("No datasets found. Set PV_DATA_BASE env var or place this app next to your 'main' data folder.")
@@ -168,7 +274,7 @@ state = st.sidebar.selectbox("Site / State", STATES, index=min(default_idx, len(
 show_map = st.sidebar.checkbox("Show Map", value=True)
 show_uncertainty = st.sidebar.checkbox("Show Uncertainty Bands (if available)", value=False)
 
-# Load data
+# Load data for selected state
 data, debug = load_state(state, _secrets_optional())
 
 # Normalize columns
@@ -176,102 +282,178 @@ for k in ("monthly_net", "hourly_net", "pv_generation", "objects", "shading"):
     if data.get(k) is not None:
         data[k] = normalize_cols(data[k])
 
-df_month = data["monthly_net"]
-df_hour  = data["hourly_net"]
-df_pv    = data["pv_generation"]
-df_shad  = data["shading"]
+df_month        = data["monthly_net"]
+df_hour         = data["hourly_net"]
+df_pv_original  = data["pv_generation"]
+df_shad_original= data["shading"]
+df_objs_original= _normalize_objects_df(data["objects"])
 
-# --- session-scoped objects df per state (so edits survive reruns) ---
-objs_session_key = f"objs_df_{state}"
-dirty_session_key = f"objs_dirty_{state}"
+# Session-scoped objects (start from ORIGINAL, but never overwrite originals)
+objs_session_key  = _objs_key(state)
+dirty_session_key = _objs_dirty_key(state)
+obj_tmp_key       = _obj_tmp_key(state)
 
-def _normalize_objects_df(df):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["object_id","object_type","latitude","longitude","height_m","shading_intensity"])
-    df = df.copy()
-    # normalize columns
-    for col in ["latitude","longitude","height_m","shading_intensity"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "object_id" in df.columns:
-        df["object_id"] = df["object_id"].astype(str)
-    return df
-
-# 1) prime session with CSV contents the first time (or if missing)
 if objs_session_key not in st.session_state:
-    st.session_state[objs_session_key] = _normalize_objects_df(data["objects"])
+    st.session_state[objs_session_key] = df_objs_original.copy()
 if dirty_session_key not in st.session_state:
     st.session_state[dirty_session_key] = False
+if obj_tmp_key not in st.session_state:
+    st.session_state[obj_tmp_key] = None
 
-# 2) use the session copy everywhere below
 df_objs = st.session_state[objs_session_key]
 
+# Session-scoped shading & pv (ACTIVE overrides)
+shad_df_key  = _shad_df_key(state)
+shad_tmp_key = _shad_path_key(state)
+pv_df_key    = _pv_df_key(state)
+pv_tmp_key   = _pv_path_key(state)
+for k in (shad_df_key, pv_df_key, shad_tmp_key, pv_tmp_key):
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+df_shad_active = st.session_state[shad_df_key] if st.session_state[shad_df_key] is not None else df_shad_original
+df_pv_active   = st.session_state[pv_df_key]   if st.session_state[pv_df_key]   is not None else df_pv_original
 
 with st.sidebar.expander("Data paths (debug)", expanded=False):
     st.write(f"Base: {debug['base']}")
     st.json(debug["exists"])
+    if st.session_state[obj_tmp_key]:
+        st.caption(f"Session object file: {st.session_state[obj_tmp_key]}")
+    if st.session_state[shad_tmp_key]:
+        st.caption(f"Session shading file: {st.session_state[shad_tmp_key]}")
+    if st.session_state[pv_tmp_key]:
+        st.caption(f"Session PV file: {st.session_state[pv_tmp_key]}")
 
-# ----- Advanced: choose timestamp columns if auto-detect fails -----
+# Advanced: choose timestamp columns (ACTIVE shading / ACTIVE pv)
 with st.sidebar.expander("Advanced • Timestamp columns", expanded=False):
     mon_guess = guess_time_col(df_month) if df_month is not None else None
     hr_guess  = guess_time_col(df_hour) if df_hour is not None else None
-    sh_guess  = guess_time_col(df_shad) if df_shad is not None else None
+    sh_guess  = guess_time_col(df_shad_active) if df_shad_active is not None else None
+    pv_guess  = guess_time_col(df_pv_active) if df_pv_active is not None else None
 
-    mon_col = st.selectbox(
-        "Monthly time column",
+    mon_col = st.selectbox("Monthly time column",
         options=(list(df_month.columns) if df_month is not None else []),
         index=(list(df_month.columns).index(mon_guess) if (df_month is not None and mon_guess in df_month.columns) else 0) if (df_month is not None and len(df_month.columns)>0) else None,
         key="mon_ts_col"
     ) if df_month is not None else None
 
-    hr_col = st.selectbox(
-        "Hourly time column",
+    hr_col = st.selectbox("Hourly time column",
         options=(list(df_hour.columns) if df_hour is not None else []),
         index=(list(df_hour.columns).index(hr_guess) if (df_hour is not None and hr_guess in df_hour.columns) else 0) if (df_hour is not None and len(df_hour.columns)>0) else None,
         key="hr_ts_col"
     ) if df_hour is not None else None
 
-    sh_col = st.selectbox(
-        "Shading time column",
-        options=(list(df_shad.columns) if df_shad is not None else []),
-        index=(list(df_shad.columns).index(sh_guess) if (df_shad is not None and sh_guess in df_shad.columns) else 0) if (df_shad is not None and len(df_shad.columns)>0) else None,
+    sh_col = st.selectbox("Shading time column (ACTIVE)",
+        options=(list(df_shad_active.columns) if df_shad_active is not None else []),
+        index=(list(df_shad_active.columns).index(sh_guess) if (df_shad_active is not None and sh_guess in df_shad_active.columns) else 0) if (df_shad_active is not None and len(df_shad_active.columns)>0) else None,
         key="sh_ts_col"
-    ) if df_shad is not None else None
+    ) if df_shad_active is not None else None
 
-# Parse timestamps (using chosen columns when available)
+    pv_col = st.selectbox("PV generation time column (ACTIVE)",
+        options=(list(df_pv_active.columns) if df_pv_active is not None else []),
+        index=(list(df_pv_active.columns).index(pv_guess) if (df_pv_active is not None and pv_guess in df_pv_active.columns) else 0) if (df_pv_active is not None and len(df_pv_active.columns)>0) else None,
+        key="pv_ts_col"
+    ) if df_pv_active is not None else None
+
+# Parse timestamps
 ts_month = parse_ts_column(df_month, mon_col) if df_month is not None else None
 ts_hour  = parse_ts_column(df_hour,  hr_col)  if df_hour  is not None else None
-ts_shad  = parse_ts_column(df_shad,  sh_col)  if df_shad  is not None else None
+ts_shad  = parse_ts_column(df_shad_active,  sh_col) if df_shad_active is not None else None
+ts_pv    = parse_ts_column(df_pv_active,    pv_col) if df_pv_active   is not None else None
 
-# ---------- KPI header ----------
-ak = annualize_monthly(df_month)
-sk = shading_kpis(df_shad)
+# ---------------------------------------------------------------------
+# Sidebar session actions: Recompute + End session
+# ---------------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("Session / Recompute")
 
-def make_bill_waterfall(baseline: float, buy: float, sell: float, net: float) -> go.Figure:
-    """
-    Build a Waterfall chart:
-      Baseline (no PV)  ->  Energy bought  ->  Export credit  ->  Net bill
-    """
-    # Ensure numbers (avoid None/NaN)
-    vals = [baseline or 0.0, -(buy or 0.0), -(sell or 0.0), net or 0.0]
-    measures = ["absolute", "relative", "relative", "total"]  # last bar is total
+def _session_paths(base, state):
+    paths  = build_paths(base, state)
+    obj_orig = paths["objects"]
+    pv_orig  = paths["pv_generation"]
+    sh_orig  = paths["shading"]
+    # session file locations
+    obj_sess = obj_orig.with_name(obj_orig.stem + "_session.csv")     # .../object/<state>_object_session.csv
+    sh_sess  = sh_orig.with_name(sh_orig.stem + "_session.csv")       # .../shading/<state>_pv_result_session.csv
+    pv_sess  = pv_orig.with_name(pv_orig.stem + "_session.csv")       # .../pv_generation/pv_generation_<state>_session.csv (if produced)
+    return obj_orig, pv_orig, sh_orig, obj_sess, pv_sess, sh_sess
 
-    fig = go.Figure(go.Waterfall(
-        name="Bill",
-        orientation="v",
-        measure=measures,
-        x=["Baseline (no PV)", "Energy bought", "Export credit", "Net bill"],
-        y=vals,
-        connector={"line": {"dash": "dot", "width": 1}},
-        text=[f"{v:,.0f}" for v in vals],
-        textposition="outside"
-    ))
-    fig.update_layout(
-        title="Annual Bill Breakdown (Estimated)",
-        showlegend=False,
-        margin=dict(l=10, r=10, t=50, b=10)
+if st.sidebar.button("Recompute shading now"):
+    base = resolve_base(_secrets_optional())
+    obj_orig, pv_orig, sh_orig, obj_sess, pv_sess, sh_sess = _session_paths(Path(base), state)
+
+    # 1) Write **SESSION OBJECTS** file only (do not touch originals)
+    try:
+        obj_sess.parent.mkdir(parents=True, exist_ok=True)
+        df_objs.to_csv(obj_sess, index=False)
+        st.session_state[obj_tmp_key] = str(obj_sess)
+    except Exception as e:
+        st.error(f"Could not write session objects CSV:\n{e}")
+    # 2) Call shading.py using session objects; write shading to session output
+    ok, msg, sh_actual, pv_actual = run_shading_for_state(
+        state=state, base_dir=Path(base),
+        objects_csv=Path(obj_sess),                 # <-- session objects!
+        pv_csv=Path(pv_orig),                       # PV original (or provide pv_sess if you also session PV)
+        out_csv=Path(sh_sess),                      # shading session path
     )
-    return fig
+    if not ok:
+        st.error(msg)
+    else:
+        st.success(msg)
+        # Load shading session
+        try:
+            target_sh = Path(sh_actual or sh_sess)
+            df_new_sh = pd.read_csv(target_sh)
+            st.session_state[shad_df_key]  = normalize_cols(df_new_sh)
+            st.session_state[shad_tmp_key] = str(target_sh)
+        except Exception as e:
+            st.error(f"Recompute OK, but failed to read shading CSV:\n{e}")
+
+        # Load PV session (if produced)
+        try:
+            if pv_actual:
+                target_pv = Path(pv_actual)
+            elif Path(pv_sess).exists():
+                target_pv = pv_sess
+            else:
+                target_pv = None
+            if target_pv:
+                df_new_pv = pd.read_csv(target_pv)
+                st.session_state[pv_df_key]  = normalize_cols(df_new_pv)
+                st.session_state[pv_tmp_key] = str(target_pv)
+                st.toast(f"Loaded session PV: {Path(target_pv).name}")
+        except Exception as e:
+            st.warning(f"No PV session file loaded: {e}")
+
+        st.toast("Session data active.")
+        st.rerun()
+
+if st.sidebar.button("End session (clean temp)"):
+    # Delete session shading + PV + OBJECT files if they exist
+    for key in (shad_tmp_key, pv_tmp_key, obj_tmp_key):
+        tmp_path = st.session_state.get(key)
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception as e:
+            st.warning(f"Could not delete temp file {tmp_path}: {e}")
+
+    # Clear session overrides & dirty flags for this state
+    for k in (_objs_key(state), _objs_dirty_key(state),
+              _shad_df_key(state), _shad_path_key(state),
+              _pv_df_key(state), _pv_path_key(state),
+              _obj_tmp_key(state)):
+        if k in st.session_state:
+            del st.session_state[k]
+
+    st.toast("Session cleared; reloading original datasets.")
+    st.rerun()
+
+# ---------------------------------------------------------------------
+# KPIs (use ACTIVE shading df)
+# ---------------------------------------------------------------------
+ak = annualize_monthly(df_month)
+sk = shading_kpis(df_shad_active)
 
 # Fallback KPIs from hourly if monthly is missing
 if (not ak) and (df_hour is not None) and (len(df_hour) > 0):
@@ -292,54 +474,51 @@ if (not ak) and (df_hour is not None) and (len(df_hour) > 0):
         "avg_buy_rate": 0.0,
     }
 
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Annual PV (kWh)", f"{ak.get('annual_pv_kwh',0):,.0f}")
-col2.metric("Annual Load (kWh)", f"{ak.get('annual_load_kwh',0):,.0f}")
-col3.metric("Self-consumption (%)", f"{ak.get('self_consumption_pct',0):.1f}%")
-col4.metric("Savings (est)", f"${ak.get('savings_est',0):,.0f}")
-col5.metric("Avg Shading Loss", (f"{sk.get('avg_shading_loss_pct',0):.1f}%" if sk.get("avg_shading_loss_pct") is not None else "—"))
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Annual PV (kWh)", f"{ak.get('annual_pv_kwh',0):,.0f}")
+c2.metric("Annual Load (kWh)", f"{ak.get('annual_load_kwh',0):,.0f}")
+c3.metric("Self-consumption (%)", f"{ak.get('self_consumption_pct',0):.1f}%")
+c4.metric("Savings (est)", f"${ak.get('savings_est',0):,.0f}")
+c5.metric("Avg Shading Loss", (f"{sk.get('avg_shading_loss_pct',0):.1f}%" if sk.get('avg_shading_loss_pct') is not None else "—"))
 
 st.markdown("---")
 
-# ---------- Tabs ----------
+# ---------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------
 tab_overview, tab_map, tab_energy, tab_bill, tab_exports, tab_data = st.tabs(
     ["Overview", "Map & Shading", "Energy Profiles", "Billing", "Export/Import", "Data"]
 )
 
-# Overview
+# -------------------- Overview --------------------------
 with tab_overview:
     st.subheader(f"Summary for {state.title()}")
     if df_month is not None and not df_month.empty:
         m = df_month.copy()
-        if ts_month is None:
+        tsm = parse_ts_column(m, guess_time_col(m)) if 'mon_ts_col' not in st.session_state else ts_month
+        if tsm is None:
             st.warning("Could not parse a timestamp column in monthly data. Choose it in the sidebar (Advanced • Timestamp columns).")
         else:
-            m["month"] = ts_month.dt.strftime("%Y-%m")
+            m["month"] = tsm.dt.strftime("%Y-%m")
             ycols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in m.columns]
             if ycols:
                 fig = px.bar(m, x="month", y=ycols, barmode="group", title="Monthly Energy")
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Waterfall (estimated)
             buy  = pd.to_numeric(m.get("Buy_$", 0), errors="coerce").fillna(0).sum()
             sell = pd.to_numeric(m.get("Sell_$", 0), errors="coerce").fillna(0).sum()
             net  = pd.to_numeric(m.get("NetBill_$", 0), errors="coerce").fillna(0).sum()
             baseline = ak.get("baseline_bill_est", 0.0)
-            wf = pd.DataFrame({
-                "stage": ["Baseline (no PV)", "Energy bought", "Export credit", "Net bill"],
-                "value": [baseline, -buy, -sell, net]
-            })
             figw = make_bill_waterfall(baseline, buy, sell, net)
-            st.plotly_chart(figw, use_container_width=True) 
-
+            st.plotly_chart(figw, use_container_width=True)
     else:
         st.info("Monthly net metering file not found for this state.")
 
-# Map & Shading
+# -------------------- Map & Shading ---------------------
 with tab_map:
     st.subheader("PV Site & Shading Objects")
 
-    # PV center by state
+    # Center
     if state in SITE_CENTERS:
         center_lat, center_lon, _tz = SITE_CENTERS[state]
     else:
@@ -349,7 +528,6 @@ with tab_map:
         else:
             center_lat, center_lon = 37.3894, -122.0839
 
-    # PV footprint controls
     with st.expander("PV array settings", expanded=False):
         colA, colB, colC = st.columns(3)
         pv_length_m = colA.number_input("Array length (m)", min_value=2.0, max_value=200.0, value=12.0, step=1.0)
@@ -358,16 +536,12 @@ with tab_map:
                                         help="0=N, 90=E, 180=S, 270=W")
 
     pv_ring = make_pv_polygon(center_lat, center_lon, length_m=pv_length_m, width_m=pv_width_m, azimuth_deg=pv_az_deg)
-
-    # mode switch
     mode = st.radio("Mode", ["View", "Edit / Add"], horizontal=True)
 
-    # Badge for unsaved changes
     if st.session_state[dirty_session_key]:
-        st.markdown("<span style='background:#fff3cd;color:#664d03;padding:4px 8px;border:1px solid #ffe69c;border-radius:6px;'>Unsaved changes</span>", unsafe_allow_html=True)
+        st.markdown("<span style='background:#fff3cd;color:#664d03;padding:4px 8px;border:1px solid #ffe69c;border-radius:6px;'>Unsaved changes (session)</span>", unsafe_allow_html=True)
 
     if mode == "View":
-        # -------- VIEW (pydeck) --------
         layers = []
         pv_feature = [{
             "type": "Feature",
@@ -376,8 +550,7 @@ with tab_map:
         }]
         layers.append(
             pdk.Layer(
-                "PolygonLayer",
-                pv_feature,
+                "PolygonLayer", pv_feature,
                 get_polygon="geometry.coordinates[0]",
                 stroked=True, filled=True,
                 get_line_color=[0,180,255], line_width_min_pixels=2,
@@ -407,7 +580,6 @@ with tab_map:
         )
         st.pydeck_chart(deck)
 
-        # legend
         legend_items = [("PV Array","#00B4FF"), ("Pole","#FFB400"), ("Building","#FF6384"), ("Tree","#32CD32")]
         legend_html = """
         <style>.legend-box{display:flex;gap:10px;background:rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.2);
@@ -419,18 +591,13 @@ with tab_map:
         st.markdown(legend_html, unsafe_allow_html=True)
 
     else:
-        # -------- EDIT / ADD (click-to-add/move/delete; session-backed) --------
-        from streamlit_folium import st_folium
-        import folium
-        import uuid
-
+        # Folium edit/add UI
         fmap = folium.Map(location=[center_lat, center_lon], zoom_start=19, tiles="CartoDB positron")
         folium.Polygon(
             locations=[[lat, lon] for lon, lat in pv_ring],
             color="#00B4FF", weight=2, fill=True, fill_opacity=0.25, tooltip="PV Array"
         ).add_to(fmap)
 
-        # render current objects as plain markers
         if not df_objs.empty:
             for _, row in df_objs.iterrows():
                 oid = str(row.get("object_id", ""))
@@ -469,11 +636,9 @@ with tab_map:
                     "height_m": float(new_height),
                     "shading_intensity": float(new_intensity),
                 }
-                st.session_state[objs_session_key] = pd.concat(
-                    [df_objs, pd.DataFrame([new_row])], ignore_index=True
-                )
+                st.session_state[objs_session_key] = pd.concat([df_objs, pd.DataFrame([new_row])], ignore_index=True)
                 st.session_state[dirty_session_key] = True
-                st.success("Added in session. Use 'Save objects to CSV' to persist.")
+                st.success("Added in session. Use 'Recompute shading' to see impact.")
                 st.rerun()
 
         # MOVE
@@ -495,7 +660,7 @@ with tab_map:
                     df2.at[idx, "longitude"] = float(new_lon2)
                     st.session_state[objs_session_key] = df2
                     st.session_state[dirty_session_key] = True
-                    st.success("Moved in session. Use 'Save objects to CSV' to persist.")
+                    st.success("Moved in session. Use 'Recompute shading' to see impact.")
                     st.rerun()
 
         # DELETE
@@ -508,60 +673,58 @@ with tab_map:
                     df2 = df_objs[df_objs["object_id"].astype(str) != del_oid].copy()
                     st.session_state[objs_session_key] = df2
                     st.session_state[dirty_session_key] = True
-                    st.success(f"Deleted '{del_oid}' in session. Use 'Save objects to CSV' to persist.")
+                    st.success(f"Deleted in session. Use 'Recompute shading' to see impact.")
                     st.rerun()
 
-        # SAVE / RELOAD
+        # Save session objects (temp) and optional persist
         colL, colR = st.columns([1,1])
-
-        if colL.button("Save objects to CSV (persist)"):
+        if colL.button("Save session objects (temp only)"):
             base = resolve_base(_secrets_optional())
-            obj_path = build_paths(base, state)["objects"]
-
-            # Ensure folder exists (scoped here, where obj_path is defined)
-            Path(obj_path).parent.mkdir(parents=True, exist_ok=True)
-
-            # Write atomically
-            tmp_path = str(obj_path) + ".tmp"
-            st.session_state[objs_session_key].to_csv(tmp_path, index=False)
-
-            import os
-            if os.path.exists(obj_path):
-                os.replace(tmp_path, obj_path)
-            else:
-                os.rename(tmp_path, obj_path)
-
-            st.session_state[dirty_session_key] = False
-            st.success(f"Saved objects to {obj_path}")
-
-        if colR.button("Reload objects from CSV"):
-            base = resolve_base(_secrets_optional())
-            obj_path = build_paths(base, state)["objects"]
+            _, _, _, obj_sess, _, _ = _session_paths(Path(base), state)
             try:
-                df_disk = pd.read_csv(obj_path)
-            except Exception:
-                df_disk = pd.DataFrame(columns=["object_id","object_type","latitude","longitude","height_m","shading_intensity"])
+                obj_sess.parent.mkdir(parents=True, exist_ok=True)
+                st.session_state[objs_session_key].to_csv(obj_sess, index=False)
+                st.session_state[obj_tmp_key] = str(obj_sess)
+                st.success(f"Session objects written: {obj_sess}")
+            except Exception as e:
+                st.error(f"Failed to write session objects:\n{e}")
 
-            # Normalize and store back into session
-            def _normalize_objects_df(df):
-                if df is None or df.empty:
-                    return pd.DataFrame(columns=["object_id","object_type","latitude","longitude","height_m","shading_intensity"])
-                df = df.copy()
-                for col in ["latitude","longitude","height_m","shading_intensity"]:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
-                if "object_id" in df.columns:
-                    df["object_id"] = df["object_id"].astype(str)
-                return df
+        if colR.button("Persist to original (optional)"):
+            st.warning("Original object CSV will be overwritten.")
+            base = resolve_base(_secrets_optional())
+            paths = build_paths(base, state)
+            obj_orig = paths["objects"]
+            try:
+                obj_orig.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = str(obj_orig) + ".tmp"
+                st.session_state[objs_session_key].to_csv(tmp_path, index=False)
+                if os.path.exists(obj_orig):
+                    os.replace(tmp_path, obj_orig)
+                else:
+                    os.rename(tmp_path, obj_orig)
+                st.session_state[dirty_session_key] = False
+                st.success(f"Persisted to: {obj_orig}")
+            except Exception as e:
+                st.error(f"Failed to persist original:\n{e}")
 
-            st.session_state[objs_session_key] = _normalize_objects_df(df_disk)
-            st.session_state[dirty_session_key] = False
-            st.info("Reloaded from CSV.")
-            st.rerun()
+    # Shading loss chart (ACTIVE)
+    st.markdown("**Shading loss over time (ACTIVE)**")
+    if df_shad_active is not None and not df_shad_active.empty:
+        sh = df_shad_active.copy()
+        ts_active = ts_shad
+        if ts_active is not None and "shading_loss" in sh.columns:
+            sh["__ts__"] = ts_active
+            sh["shading_loss"] = pd.to_numeric(sh["shading_loss"], errors="coerce")
+            daily = sh.groupby(sh["__ts__"].dt.date)["shading_loss"].mean().reset_index()
+            daily.columns = ["date","avg_shading_loss"]
+            fig = px.line(daily, x="date", y="avg_shading_loss", title="Average Daily Shading Loss (Active)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Active shading file has no parseable timestamp or no 'shading_loss' column.")
+    else:
+        st.caption("No active shading data.")
 
-
-
-# Energy Profiles
+# -------------------- Energy Profiles -------------------
 with tab_energy:
     st.subheader("Energy Production & Load")
     if df_hour is not None and not df_hour.empty:
@@ -575,7 +738,6 @@ with tab_energy:
                 fig = px.line(h, x="__ts__", y=ycols, title="Power (kW)")
                 st.plotly_chart(fig, use_container_width=True)
 
-            # 8760 pivot
             value_col = "PV_E_kWh" if "PV_E_kWh" in h.columns else ("PV_P_kW" if "PV_P_kW" in h.columns else None)
             if value_col:
                 pv = h[["__ts__", value_col]].copy()
@@ -589,7 +751,7 @@ with tab_energy:
     else:
         st.info("Hourly net file not found for this state.")
 
-# Billing
+# -------------------- Billing ---------------------------
 with tab_bill:
     st.subheader("Billing & Savings")
     if df_month is not None and not df_month.empty:
@@ -598,21 +760,18 @@ with tab_bill:
             st.warning("Could not parse a timestamp column in monthly data. Choose it in the sidebar (Advanced • Timestamp columns).")
         else:
             m["month"] = ts_month.dt.strftime("%Y-%m")
-
-            # Monthly costs bars
             cols = [c for c in ["Buy_$", "Sell_$", "NetBill_$"] if c in m.columns]
             if cols:
                 fig = px.bar(m, x="month", y=cols, barmode="group", title="Monthly Costs")
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Cost & energy table (only columns that exist)
             table_cols = ["month"]
             table_cols += [c for c in ["Import_kWh", "Export_kWh", "Buy_$", "Sell_$", "NetBill_$"] if c in m.columns]
             st.dataframe(m[table_cols])
     else:
         st.info("Monthly net metering file not found for this state.")
 
-# Export / Import
+# -------------------- Export / Import -------------------
 with tab_exports:
     st.subheader("Import vs Export (Hourly)")
     if df_hour is not None and not df_hour.empty:
@@ -630,24 +789,35 @@ with tab_exports:
     else:
         st.info("Hourly net file not found for this state.")
 
-# Data tab (samples for debugging)
+# -------------------- Data (debug) ----------------------
 with tab_data:
     st.subheader("Raw Data Snapshots")
-    if df_pv is not None and not df_pv.empty:
-        st.write("PV Generation (sample)")
-        st.dataframe(df_pv.head(200))
+
+    if df_pv_active is not None and not df_pv_active.empty:
+        st.write("PV Generation (ACTIVE sample)")
+        st.dataframe(df_pv_active.head(200))
+        if st.session_state[pv_df_key] is not None:
+            st.caption(f"Showing session file: {st.session_state[pv_tmp_key]}")
+        else:
+            st.caption("Showing original PV generation csv.")
     else:
         st.caption("No PV generation csv found or it is empty.")
 
-    if df_shad is not None and not df_shad.empty:
-        st.write("Shading Result (sample)")
-        st.dataframe(df_shad.head(200))
+    if df_shad_active is not None and not df_shad_active.empty:
+        st.write("Shading Result (ACTIVE sample)")
+        st.dataframe(df_shad_active.head(200))
+        if st.session_state[shad_df_key] is not None:
+            st.caption(f"Showing session file: {st.session_state[shad_tmp_key]}")
+        else:
+            st.caption("Showing original shading csv.")
     else:
         st.caption("No shading result csv found or it is empty.")
 
     if df_objs is not None and not df_objs.empty:
-        st.write("Objects")
+        st.write("Objects (session copy; originals untouched)")
         st.dataframe(df_objs)
+        if st.session_state[obj_tmp_key]:
+            st.caption(f"Session objects file: {st.session_state[obj_tmp_key]}")
     else:
         st.caption("No object csv found or it is empty.")
 

@@ -104,7 +104,6 @@ def get_site_center(state: str, df_objs: pd.DataFrame | None):
     # default fallback (Mountain View-ish)
     return 37.3894, -122.0839
 
-
 DEFAULT_WIDTH_BY_TYPE = {"Pole": 1.0, "Tree": 3.0, "Building": 10.0, "Other": 2.0}
 
 def latlon_to_dxdy_meters(lat0: float, lon0: float, lat1: float, lon1: float):
@@ -143,8 +142,6 @@ def enrich_objects_with_derived(df: pd.DataFrame, center_lat: float, center_lon:
             df2[c] = pd.to_numeric(df2[c], errors="coerce")
 
     return df2
-
-
 
 def meters_to_latlon_offsets(lat_deg: float, dx_m: float, dy_m: float):
     lat_rad = math.radians(lat_deg)
@@ -197,6 +194,11 @@ def _shad_df_key(state):     return f"shading_df_session_{state}"
 def _shad_path_key(state):   return f"shading_tmp_path_{state}"
 def _pv_df_key(state):       return f"pv_df_session_{state}"
 def _pv_path_key(state):     return f"pv_tmp_path_{state}"
+# --- net-metering session keys ---
+def _net_hour_df_key(state):    return f"net_hour_df_session_{state}"
+def _net_month_df_key(state):   return f"net_month_df_session_{state}"
+def _net_hour_path_key(state):  return f"net_hour_tmp_path_{state}"
+def _net_month_path_key(state): return f"net_month_tmp_path_{state}"
 
 def _normalize_objects_df(df):
     if df is None or df.empty:
@@ -221,6 +223,56 @@ def _find_shading_script() -> Path | None:
         if p.exists():
             return p
     return None
+
+def _find_pvnet_script() -> Path | None:
+    here = Path(__file__).resolve().parent
+    cands = [
+        # original name
+        here / "pv_net_metering.py",
+        here.parent / "pv_net_metering.py",
+        here.parent / "main" / "pv_net_metering.py",
+        here.parent.parent / "pv_net_metering.py",
+        # your renamed script
+        here / "consumption.py",
+        here.parent / "consumption.py",
+        here.parent / "main" / "consumption.py",
+        here.parent.parent / "consumption.py",
+    ]
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+def run_net_metering_for_state(state: str, base_dir: Path, use_session: bool=True):
+    """
+    Call pv_net_metering.py (or consumption.py) for a single state.
+    Returns (ok, message, hourly_csv_path|None, monthly_csv_path|None)
+    """
+    script = _find_pvnet_script()
+    if script is None:
+        return False, "pv_net_metering.py / consumption.py not found.", None, None
+
+    in_dir   = Path(base_dir) / "shading"
+    out_dir  = Path(base_dir) / "net_metering"
+    load_dir = Path(base_dir) / "loads"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    args = [sys.executable, str(script), "--state", state,
+            "--in", str(in_dir), "--out", str(out_dir), "--loads", str(load_dir)]
+    if use_session:
+        args.append("--session")
+
+    try:
+        cp = subprocess.run(args, capture_output=True, text=True, timeout=900, cwd=str(script.parent))
+        if cp.returncode != 0:
+            return False, f"pv_net_metering.py failed (code {cp.returncode}).\nSTDERR:\n{cp.stderr}", None, None
+    except Exception as e:
+        return False, f"pv_net_metering.py exception: {e}", None, None
+
+    suf = "_session" if use_session else ""
+    hourly = out_dir / f"{state}_hourly_net{suf}.csv"
+    monthly = out_dir / f"{state}_monthly_net{suf}.csv"
+    return (hourly.exists() or monthly.exists()), "pv_net_metering.py OK.", (str(hourly) if hourly.exists() else None), (str(monthly) if monthly.exists() else None)
 
 # ---- robust runner: returns actual shading + (optional) pv file it finds ----
 def run_shading_for_state(state: str, base_dir: Path, objects_csv: Path, pv_csv: Path, out_csv: Path):
@@ -349,13 +401,29 @@ objs_session_key  = _objs_key(state)
 dirty_session_key = _objs_dirty_key(state)
 obj_tmp_key       = _obj_tmp_key(state)
 
+net_hour_key   = _net_hour_df_key(state)
+net_month_key  = _net_month_df_key(state)
+net_hour_path  = _net_hour_path_key(state)
+net_month_path = _net_month_path_key(state)
+
+for k in (net_hour_key, net_month_key, net_hour_path, net_month_path):
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+# Use session net-metering files if they exist
+df_month_active = st.session_state[net_month_key] if st.session_state[net_month_key] is not None else df_month
+df_hour_active  = st.session_state[net_hour_key]  if st.session_state[net_hour_key]  is not None else df_hour
+
+# Downstream code expects df_month/df_hour names
+df_month = df_month_active
+df_hour  = df_hour_active
+
 if objs_session_key not in st.session_state:
     st.session_state[objs_session_key] = df_objs_original.copy()
 if dirty_session_key not in st.session_state:
     st.session_state[dirty_session_key] = False
 if obj_tmp_key not in st.session_state:
     st.session_state[obj_tmp_key] = None
-
 
 df_objs = st.session_state[objs_session_key]
 
@@ -364,7 +432,7 @@ center_lat, center_lon = get_site_center(state, df_objs)
 if not df_objs.empty:
     df2 = df_objs.copy()
 
-    # Fill width_m defaults if missing
+    # Fill width_m defaults if missing (for legacy rows in original CSVs)
     if "width_m" not in df2.columns:
         df2["width_m"] = np.nan
     if "object_type" in df2.columns:
@@ -384,7 +452,6 @@ if not df_objs.empty:
 
     st.session_state[objs_session_key] = df2
     df_objs = df2
-
 
 # Session-scoped shading & pv (ACTIVE overrides)
 shad_df_key  = _shad_df_key(state)
@@ -469,15 +536,25 @@ if st.sidebar.button("Recompute shading now"):
     # 1) Write **SESSION OBJECTS** file only (do not touch originals)
     try:
         obj_sess.parent.mkdir(parents=True, exist_ok=True)
-        df_objs.to_csv(obj_sess, index=False)
+        # Ensure distance_m / azimuth_deg (and numeric cleanup) are present
+        center_lat, center_lon = get_site_center(state, st.session_state[objs_session_key])
+        objs_enriched = enrich_objects_with_derived(st.session_state[objs_session_key], center_lat, center_lon)
+
+        # Enforce width_m > 0
+        if "width_m" not in objs_enriched.columns or objs_enriched["width_m"].fillna(0).le(0).any():
+            st.error("All objects must have a positive width_m to run shading. Please add width for missing objects.")
+            st.stop()
+
+        objs_enriched.to_csv(obj_sess, index=False)
         st.session_state[obj_tmp_key] = str(obj_sess)
     except Exception as e:
         st.error(f"Could not write session objects CSV:\n{e}")
+
     # 2) Call shading.py using session objects; write shading to session output
     ok, msg, sh_actual, pv_actual = run_shading_for_state(
         state=state, base_dir=Path(base),
-        objects_csv=Path(obj_sess),                 # <-- session objects!
-        pv_csv=Path(pv_orig),                       # PV original (or provide pv_sess if you also session PV)
+        objects_csv=Path(obj_sess),                 # <-- session objects
+        pv_csv=Path(pv_orig),                       # use original PV unless your shading writes PV session too
         out_csv=Path(sh_sess),                      # shading session path
     )
     if not ok:
@@ -509,12 +586,38 @@ if st.sidebar.button("Recompute shading now"):
         except Exception as e:
             st.warning(f"No PV session file loaded: {e}")
 
+        # 3) Recompute net-metering from session shading and load the results
+        ok2, msg2, hour_path, mon_path = run_net_metering_for_state(
+            state=state, base_dir=Path(debug["base"]), use_session=True
+        )
+        if not ok2:
+            st.warning(msg2)
+        else:
+            st.toast("Net-metering recomputed (session).")
+            try:
+                if hour_path and os.path.exists(hour_path):
+                    df_hour_sess = pd.read_csv(hour_path)
+                    st.session_state[net_hour_key]  = normalize_cols(df_hour_sess)
+                    st.session_state[net_hour_path] = hour_path
+                if mon_path and os.path.exists(mon_path):
+                    df_month_sess = pd.read_csv(mon_path)
+                    st.session_state[net_month_key]  = normalize_cols(df_month_sess)
+                    st.session_state[net_month_path] = mon_path
+            except Exception as e:
+                st.warning(f"Loaded shading session, but failed to load net-metering CSVs: {e}")
+
         st.toast("Session data active.")
         st.rerun()
 
 if st.sidebar.button("End session (clean temp)"):
-    # Delete session shading + PV + OBJECT files if they exist
-    for key in (shad_tmp_key, pv_tmp_key, obj_tmp_key):
+    # Try to delete temp files for this state
+    for key in (
+        _obj_tmp_key(state),
+        _shad_path_key(state),
+        _pv_path_key(state),
+        _net_hour_path_key(state),
+        _net_month_path_key(state),
+    ):
         tmp_path = st.session_state.get(key)
         try:
             if tmp_path and os.path.exists(tmp_path):
@@ -522,11 +625,15 @@ if st.sidebar.button("End session (clean temp)"):
         except Exception as e:
             st.warning(f"Could not delete temp file {tmp_path}: {e}")
 
-    # Clear session overrides & dirty flags for this state
-    for k in (_objs_key(state), _objs_dirty_key(state),
-              _shad_df_key(state), _shad_path_key(state),
-              _pv_df_key(state), _pv_path_key(state),
-              _obj_tmp_key(state)):
+    # Clear session objects & all session datasets for this state
+    for k in (
+        _objs_key(state), _objs_dirty_key(state),
+        _shad_df_key(state), _shad_path_key(state),
+        _pv_df_key(state), _pv_path_key(state),
+        _net_hour_df_key(state), _net_month_df_key(state),
+        _net_hour_path_key(state), _net_month_path_key(state),
+        _obj_tmp_key(state),
+    ):
         if k in st.session_state:
             del st.session_state[k]
 
@@ -534,7 +641,7 @@ if st.sidebar.button("End session (clean temp)"):
     st.rerun()
 
 # ---------------------------------------------------------------------
-# KPIs (use ACTIVE shading df)
+# KPIs (use ACTIVE net-metering dfs -> may be session)
 # ---------------------------------------------------------------------
 ak = annualize_monthly(df_month)
 sk = shading_kpis(df_shad_active)
@@ -721,7 +828,6 @@ with tab_map:
                 new_distance = float(math.hypot(dx, dy))
                 new_azimuth  = float(bearing_deg_from_dxdy(dx, dy))
 
-                # Validate width
                 if new_width <= 0:
                     st.error("Width (m) must be > 0.")
                 else:
@@ -731,10 +837,8 @@ with tab_map:
                         "latitude": float(new_lat),
                         "longitude": float(new_lon),
                         "height_m": float(new_height),
-                        "width_m": float(new_width),              # <- now explicit
+                        "width_m": float(new_width),
                         "shading_intensity": float(new_intensity),
-
-                        # required by shading.py
                         "distance_m": new_distance,
                         "azimuth_deg": new_azimuth,
                     }
@@ -744,7 +848,6 @@ with tab_map:
                     st.session_state[dirty_session_key] = True
                     st.success("Added to session. Use 'Recompute shading' to see impact.")
                     st.rerun()
-
 
         # MOVE
         with c2.expander("Move existing object", expanded=False):
@@ -781,7 +884,6 @@ with tab_map:
                     st.success("Moved in session. Use 'Recompute shading' to see impact.")
                     st.rerun()
 
-
         # DELETE
         with c3.expander("Delete object", expanded=False):
             if df_objs.empty or "object_id" not in df_objs.columns:
@@ -802,7 +904,9 @@ with tab_map:
             _, _, _, obj_sess, _, _ = _session_paths(Path(base), state)
             try:
                 obj_sess.parent.mkdir(parents=True, exist_ok=True)
-                st.session_state[objs_session_key].to_csv(obj_sess, index=False)
+                center_lat, center_lon = get_site_center(state, st.session_state[objs_session_key])
+                objs_enriched = enrich_objects_with_derived(st.session_state[objs_session_key], center_lat, center_lon)
+                objs_enriched.to_csv(obj_sess, index=False)
                 st.session_state[obj_tmp_key] = str(obj_sess)
                 st.success(f"Session objects written: {obj_sess}")
             except Exception as e:

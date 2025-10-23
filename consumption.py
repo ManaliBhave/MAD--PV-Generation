@@ -1,20 +1,21 @@
-# pv_net_metering.py
+# pv_net_metering.py / consumption.py
 import os
+import sys
 import glob
 import math
+import argparse
 import pandas as pd
 import numpy as np
 
 # ----------------------------
-# Input / Output folders
+# Defaults (folders can be overridden by CLI)
 # ----------------------------
-IN_DIR = "shading"            # where *_pv_result.csv live
-LOAD_DIR = "loads"            # optional: put per-state load profiles here (columns: timestamp, load_kW)
-OUT_DIR = "net_metering"
-os.makedirs(OUT_DIR, exist_ok=True)
+DEFAULT_IN_DIR   = "shading"            # where *_pv_result.csv (or *_pv_result_session.csv) live
+DEFAULT_LOAD_DIR = "loads"              # optional measured loads: <state>_load.csv with timestamp, load_kW
+DEFAULT_OUT_DIR  = "net_metering"
 
 # ----------------------------
-# Sites (from your message)
+# Sites (from your project)
 # ----------------------------
 SITES = {
     "california":      {"lat": 37.390026, "lon": -122.08123,  "tz": "America/Los_Angeles"},
@@ -24,7 +25,7 @@ SITES = {
     "colorado":        {"lat": 39.306108, "lon": -102.269356, "tz": "America/Denver"},
     "michigan":        {"lat": 45.421402, "lon": -83.81833,   "tz": "America/Detroit"},
     "maine":           {"lat": 44.952297, "lon": -67.660831,  "tz": "America/New_York"},
-    "washington":      {"lat": 47.606139, "lon": -122.332848, "tz": "America/Los_Angeles"},  # Seattle
+    "washington":      {"lat": 47.606139, "lon": -122.332848, "tz": "America/Los_Angeles"},
     "missouri":        {"lat": 36.083959, "lon": -89.829251,  "tz": "America/Chicago"},
     "nevada":          {"lat": 41.947679, "lon": -116.098709, "tz": "America/Los_Angeles"},
     "florida":         {"lat": 25.76168,  "lon": -80.191179,  "tz": "America/New_York"},
@@ -33,105 +34,98 @@ SITES = {
 # ----------------------------
 # Tariffs – edit as needed (USD/kWh)
 # ----------------------------
-DEFAULT_BUY  = 0.20  # what the home pays to import from grid
-DEFAULT_SELL = 0.08  # what the utility credits for exports (net metering / feed-in)
+DEFAULT_BUY  = 0.20  # import from grid
+DEFAULT_SELL = 0.08  # export credit
 TARIFFS = {
-    # override any state; omitted states use defaults
     # "california": {"buy": 0.28, "sell": 0.08},
 }
 
 # ----------------------------
 # Household load model (synthetic)
 # ----------------------------
-DEFAULT_DAILY_KWH = 25.0   # typical daily household consumption
-# You can override per state if you like:
+DEFAULT_DAILY_KWH = 25.0
 DAILY_KWH = {
     # "texas": 30.0,
 }
 
+# ----------------------------
+# CLI
+# ----------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Compute net-metering results from shading PV outputs.")
+    p.add_argument("--state", help="State key (e.g., texas). If omitted, run all states found in SITES.", default=None)
+    p.add_argument("--session", action="store_true", help="Use *_session inputs if present and write *_session outputs.")
+    p.add_argument("--in", dest="in_dir", default=DEFAULT_IN_DIR, help="Input shading dir (default: shading)")
+    p.add_argument("--out", dest="out_dir", default=DEFAULT_OUT_DIR, help="Output net-metering dir (default: net_metering)")
+    p.add_argument("--loads", dest="load_dir", default=DEFAULT_LOAD_DIR, help="Measured loads dir (default: loads)")
+    return p.parse_args()
+
+# ----------------------------
+# Load helpers
+# ----------------------------
 def normalized_residential_shape(hours):
-    """
-    Simple 24h shape (array of length=hours) with morning & evening peaks.
-    Returns values that sum to 1 over a 24h window.
-    """
     h = np.arange(hours, dtype=float) % 24
-    # two cosine bumps: morning 7–10, evening 18–22
     morning = np.clip(np.cos((h-8)/3 * np.pi), 0, None)
     evening = np.clip(np.cos((h-20)/4 * np.pi), 0, None)
-    base = 0.3  # small baseload
-    shape = base + 0.7*(0.5*morning + evening)  # weight evening higher
-    # ensure no negatives and normalize per 24h
-    shape = np.maximum(shape, 0)
-    # normalize by average over each full day
-    return shape
+    base = 0.3
+    shape = base + 0.7*(0.5*morning + evening)
+    return np.maximum(shape, 0)
 
 def scale_load_to_daily(df_ts, daily_kwh):
-    """
-    Build load_kW series for df_ts (DatetimeIndex) so each local day sums to daily_kwh.
-    """
-    # Build a repeating 24h shape
     shape = normalized_residential_shape(len(df_ts))
-    # Compute per-day scaler so each local day hits daily_kwh
     s = pd.Series(shape, index=df_ts, dtype=float)
-    # initial unscaled daily energy assuming 1h steps
-    daily_unscaled = s.resample("D").sum(min_count=1)
-    # avoid divide by zero
-    daily_unscaled = daily_unscaled.replace(0, np.nan)
-    # scaler per day
+    daily_unscaled = s.resample("D").sum(min_count=1).replace(0, np.nan)
     scaler = (daily_kwh / daily_unscaled).reindex(daily_unscaled.index).fillna(0.0)
-    # broadcast to hourly
     scaler_hr = scaler.reindex(s.index, method="ffill")
     load_kW = s * scaler_hr
     return load_kW
 
-def try_load_profile(state_key, tz):
-    """
-    If you have a measured load file, place it in LOAD_DIR as:
-    loads/<state_key>_load.csv with columns: timestamp, load_kW
-    It will be parsed (tz-aware). Otherwise we return None.
-    """
-    path = os.path.join(LOAD_DIR, f"{state_key}_load.csv")
+def try_load_profile(state_key, tz, load_dir):
+    path = os.path.join(load_dir, f"{state_key}_load.csv")
     if not os.path.exists(path):
         return None
     df = pd.read_csv(path)
     ts_col = "timestamp" if "timestamp" in df.columns else df.columns[0]
-    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce", utc=True).dt.tz_convert(tz)
-    df = df.dropna(subset=[ts_col]).sort_values(ts_col)
+    ser = pd.to_datetime(df[ts_col], errors="coerce", utc=True).dt.tz_convert(tz)
+    df = df.set_index(ser).drop(columns=[ts_col])
     if "load_kW" not in df.columns:
-        raise ValueError(f"{path} must contain a 'load_kW' column")
-    df = df.set_index(ts_col)
+        raise ValueError(f"{path} must contain 'load_kW' column")
     return df["load_kW"]
 
-def load_pv_result(state_key, tz):
+def load_pv_result_for_state(state_key, tz, in_dir, use_session=False):
     """
-    Load one *_pv_result.csv; return DataFrame indexed by local tz:
-    columns: PV_P_kW, PV_E_kWh, dt_hr (computed if needed)
+    Load one PV result CSV:
+      - If use_session=True, prefer shading/<state>_pv_result_session.csv (fallback to non-session if missing)
+      - Else use shading/<state>_pv_result.csv
+    Returns DataFrame indexed by local tz with columns: PV_P_kW, PV_E_kWh, dt_hr
     """
-    # find file like shading/<state>_pv_result.csv
-    pattern = os.path.join(IN_DIR, f"{state_key}_pv_result.csv")
-    matches = glob.glob(pattern)
-    if not matches:
-        raise FileNotFoundError(f"No PV file found: {pattern}")
-    path = matches[0]
+    patterns = []
+    if use_session:
+        patterns.append(os.path.join(in_dir, f"{state_key}_pv_result_session.csv"))
+    patterns.append(os.path.join(in_dir, f"{state_key}_pv_result.csv"))
+
+    path = None
+    for patt in patterns:
+        matches = glob.glob(patt)
+        if matches:
+            path = matches[0]
+            break
+    if path is None:
+        raise FileNotFoundError(f"No PV file found for '{state_key}'. Looked for: {', '.join(patterns)}")
 
     df = pd.read_csv(path)
 
-    # timestamp column (your files use timestamp_local)
-    ts = "timestamp_local" if "timestamp_local" in df.columns else "period_end"
-    if ts not in df.columns:
+    # timestamp column (commonly 'timestamp_local' from your pipeline)
+    ts_col = "timestamp_local" if "timestamp_local" in df.columns else ("period_end" if "period_end" in df.columns else None)
+    if ts_col is None or ts_col not in df.columns:
         raise ValueError(f"{path}: missing timestamp column 'timestamp_local' or 'period_end'.")
 
-    # parse timestamps; bring to local tz
-    # If ts looks tz-aware already, parse with utc then convert; otherwise localize.
-    ser = pd.to_datetime(df[ts], errors="coerce", utc=True)
-    # If your CSV timestamps are naive local time, uncomment next line instead:
-    # ser = pd.to_datetime(df[ts], errors="coerce").dt.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
-    ser = ser.dt.tz_convert(tz)
-
-    df = df.set_index(ser).drop(columns=[ts])
+    # parse timestamps → local tz index
+    ser = pd.to_datetime(df[ts_col], errors="coerce", utc=True).dt.tz_convert(tz)
+    df = df.set_index(ser).drop(columns=[ts_col])
     df.index.name = "ts"
 
-    # pick post-shading power & energy
+    # post-shading power & energy
     p_col = "P_actual_new_kW" if "P_actual_new_kW" in df.columns else "P_ac"
     PV_P = pd.to_numeric(df[p_col], errors="coerce").fillna(0.0)
 
@@ -139,7 +133,6 @@ def load_pv_result(state_key, tz):
         PV_E = pd.to_numeric(df["E_kWh_new"], errors="coerce").fillna(0.0)
         dt_hr = None
     else:
-        # compute dt hours and energy from power
         dt = df.index.to_series().diff().dt.total_seconds().div(3600.0)
         dt.iloc[0] = dt.median() if not math.isnan(dt.median()) else 1.0
         dt_hr = dt.clip(lower=0.0, upper=2.0)
@@ -147,7 +140,6 @@ def load_pv_result(state_key, tz):
 
     out = pd.DataFrame({"PV_P_kW": PV_P, "PV_E_kWh": PV_E}, index=df.index)
     if dt_hr is None:
-        # infer interval from index differences (assume hourly if missing)
         dt_hr = out.index.to_series().diff().dt.total_seconds().div(3600.0)
         dt_hr.iloc[0] = dt_hr.median() if not math.isnan(dt_hr.median()) else 1.0
         dt_hr = dt_hr.clip(lower=0.0, upper=2.0)
@@ -159,40 +151,25 @@ def get_rates(state_key):
     return float(spec.get("buy", DEFAULT_BUY)), float(spec.get("sell", DEFAULT_SELL))
 
 # ----------------------------
-# Core computation
+# Per-state computation
 # ----------------------------
-per_state_summaries = []
+def compute_and_write(state_key, tz, in_dir, out_dir, load_dir, use_session=False):
+    pv = load_pv_result_for_state(state_key, tz, in_dir, use_session=use_session)
 
-for state_key, meta in SITES.items():
-    tz = meta["tz"]
-
-    try:
-        pv = load_pv_result(state_key, tz)
-    except Exception as e:
-        print(f"[{state_key}] skipped: {e}")
-        continue
-
-    # Load profile: measured if available, else synthetic scaled per day
-    measured = try_load_profile(state_key, tz)
+    measured = try_load_profile(state_key, tz, load_dir)
     if measured is not None:
-        # align to PV index
         load_kW = measured.reindex(pv.index).interpolate(limit_direction="both").fillna(0.0)
     else:
         daily_kwh = DAILY_KWH.get(state_key, DEFAULT_DAILY_KWH)
         load_kW = scale_load_to_daily(pv.index, daily_kwh)
 
-    # Energy per step from load
     load_E = load_kW * pv["dt_hr"]
-
-    # Net power/energy (positive = export; negative = import)
     net_P = pv["PV_P_kW"] - load_kW
     net_E = pv["PV_E_kWh"] - load_E
 
-    # Separate import/export kWh
     export_kWh = net_E.clip(lower=0.0)
     import_kWh = (-net_E).clip(lower=0.0)
 
-    # Costs & savings
     buy_rate, sell_rate = get_rates(state_key)
     cost_without_pv = (load_E.sum()) * buy_rate
     grid_cost = (import_kWh.sum()) * buy_rate
@@ -200,7 +177,6 @@ for state_key, meta in SITES.items():
     net_bill = grid_cost - export_credit
     savings = cost_without_pv - net_bill
 
-    # Assemble hourly result
     out = pd.DataFrame({
         "PV_P_kW": pv["PV_P_kW"],
         "PV_E_kWh": pv["PV_E_kWh"],
@@ -213,9 +189,9 @@ for state_key, meta in SITES.items():
     }, index=pv.index)
     out.index.name = "timestamp_local"
 
-    # Daily & monthly rollups
+    # rollups
     daily = out.resample("D").sum(min_count=1)
-    monthly = out.resample("MS").sum(min_count=1)  # month starts
+    monthly = out.resample("MS").sum(min_count=1)
 
     daily["Buy_$"]  = daily["Import_kWh"] * buy_rate
     daily["Sell_$"] = daily["Export_kWh"] * sell_rate
@@ -225,16 +201,18 @@ for state_key, meta in SITES.items():
     monthly["Sell_$"] = monthly["Export_kWh"] * sell_rate
     monthly["NetBill_$"] = monthly["Buy_$"] - monthly["Sell_$"]
 
-    # Save per state
-    out_path = os.path.join(OUT_DIR, f"{state_key}_hourly_net.csv")
-    day_path = os.path.join(OUT_DIR, f"{state_key}_daily_net.csv")
-    mon_path = os.path.join(OUT_DIR, f"{state_key}_monthly_net.csv")
+    # output paths (session-safe)
+    suf = "_session" if use_session else ""
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{state_key}_hourly_net{suf}.csv")
+    day_path = os.path.join(out_dir, f"{state_key}_daily_net{suf}.csv")
+    mon_path = os.path.join(out_dir, f"{state_key}_monthly_net{suf}.csv")
+
     out.to_csv(out_path)
     daily.to_csv(day_path)
     monthly.to_csv(mon_path)
 
-    # Summary row
-    per_state_summaries.append({
+    summary = {
         "state": state_key,
         "buy_rate_$per_kWh": buy_rate,
         "sell_rate_$per_kWh": sell_rate,
@@ -247,12 +225,47 @@ for state_key, meta in SITES.items():
         "export_credit_$": export_credit,
         "net_bill_$": net_bill,
         "savings_$": savings,
-    })
+        "_hourly_path": out_path,
+        "_monthly_path": mon_path,
+        "_daily_path": day_path,
+    }
+    return summary
 
-# Combined summary
-summary_df = pd.DataFrame(per_state_summaries).sort_values("state")
-summary_df.to_csv(os.path.join(OUT_DIR, "summary_all_states.csv"), index=False)
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    args = parse_args()
+    in_dir   = args.in_dir
+    out_dir  = args.out_dir
+    load_dir = args.load_dir
+    use_session = args.session
 
-print("✅ Finished.")
-print(f"Saved hourly/daily/monthly results per state in: {OUT_DIR}/")
-print("Top-level summary: summary_all_states.csv")
+    summaries = []
+
+    states_to_run = [args.state.lower()] if args.state else list(SITES.keys())
+    for state_key in states_to_run:
+        if state_key not in SITES:
+            print(f"[{state_key}] skipped: not in SITES dict.")
+            continue
+        tz = SITES[state_key]["tz"]
+        try:
+            s = compute_and_write(state_key, tz, in_dir, out_dir, load_dir, use_session=use_session)
+            summaries.append(s)
+            tag = "SESSION" if use_session else "BASE"
+            print(f"✅ {state_key} ({tag}) → hourly/daily/monthly written to {out_dir}/")
+        except Exception as e:
+            print(f"[{state_key}] skipped: {e}")
+
+    # Top-level CSV (just for convenience; contains only states processed in this run)
+    if summaries:
+        suf = "_session" if use_session else ""
+        summary_df = pd.DataFrame(summaries).sort_values("state")
+        os.makedirs(out_dir, exist_ok=True)
+        summary_df.to_csv(os.path.join(out_dir, f"summary_all_states{suf}.csv"), index=False)
+        print(f"Summary saved: {os.path.join(out_dir, f'summary_all_states{suf}.csv')}")
+    else:
+        print("No states processed.")
+
+if __name__ == "__main__":
+    main()

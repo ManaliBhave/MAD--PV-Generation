@@ -90,6 +90,62 @@ def parse_ts_column(df: pd.DataFrame, col: str | None):
     return None
 
 # --- geo helpers ------------------------------------------------------
+# --- Derived-geometry helpers (PV-relative) ---
+
+def get_site_center(state: str, df_objs: pd.DataFrame | None):
+    """Return (center_lat, center_lon) for a state. Falls back to object mean or a default."""
+    if state in SITE_CENTERS:
+        return SITE_CENTERS[state][0], SITE_CENTERS[state][1]
+    if df_objs is not None and not df_objs.empty and {"latitude","longitude"}.issubset(df_objs.columns):
+        lat = pd.to_numeric(df_objs["latitude"], errors="coerce").dropna()
+        lon = pd.to_numeric(df_objs["longitude"], errors="coerce").dropna()
+        if len(lat) and len(lon):
+            return float(lat.mean()), float(lon.mean())
+    # default fallback (Mountain View-ish)
+    return 37.3894, -122.0839
+
+
+DEFAULT_WIDTH_BY_TYPE = {"Pole": 1.0, "Tree": 3.0, "Building": 10.0, "Other": 2.0}
+
+def latlon_to_dxdy_meters(lat0: float, lon0: float, lat1: float, lon1: float):
+    lat_rad = math.radians(lat0)
+    dy = (lat1 - lat0) * 111_320.0
+    dx = (lon1 - lon0) * 111_320.0 * (math.cos(lat_rad) if abs(math.cos(lat_rad)) > 1e-6 else 0.0)
+    return dx, dy
+
+def bearing_deg_from_dxdy(dx_m: float, dy_m: float):
+    # 0°=North, 90°=East …
+    return (math.degrees(math.atan2(dx_m, dy_m)) + 360.0) % 360.0
+
+def enrich_objects_with_derived(df: pd.DataFrame, center_lat: float, center_lon: float) -> pd.DataFrame:
+    """Ensure distance_m & azimuth_deg from lat/lon. Do NOT fill width_m automatically."""
+    if df is None or df.empty:
+        return df
+    df2 = df.copy()
+
+    # Ensure columns exist
+    for col in ["width_m", "distance_m", "azimuth_deg"]:
+        if col not in df2.columns:
+            df2[col] = np.nan
+
+    # Compute distance/azimuth from lat/lon to PV center
+    for i, row in df2.iterrows():
+        lat = pd.to_numeric(row.get("latitude"), errors="coerce")
+        lon = pd.to_numeric(row.get("longitude"), errors="coerce")
+        if pd.notna(lat) and pd.notna(lon):
+            dx, dy = latlon_to_dxdy_meters(center_lat, center_lon, float(lat), float(lon))
+            df2.at[i, "distance_m"] = float(math.hypot(dx, dy))
+            df2.at[i, "azimuth_deg"] = float(bearing_deg_from_dxdy(dx, dy))
+
+    # Numeric cleanup
+    for c in ["width_m", "distance_m", "azimuth_deg", "height_m", "shading_intensity"]:
+        if c in df2.columns:
+            df2[c] = pd.to_numeric(df2[c], errors="coerce")
+
+    return df2
+
+
+
 def meters_to_latlon_offsets(lat_deg: float, dx_m: float, dy_m: float):
     lat_rad = math.radians(lat_deg)
     dlat = dy_m / 111_320.0
@@ -300,7 +356,35 @@ if dirty_session_key not in st.session_state:
 if obj_tmp_key not in st.session_state:
     st.session_state[obj_tmp_key] = None
 
+
 df_objs = st.session_state[objs_session_key]
+
+center_lat, center_lon = get_site_center(state, df_objs)
+# After df_objs is created and center_lat/center_lon are known:
+if not df_objs.empty:
+    df2 = df_objs.copy()
+
+    # Fill width_m defaults if missing
+    if "width_m" not in df2.columns:
+        df2["width_m"] = np.nan
+    if "object_type" in df2.columns:
+        need_w = df2["width_m"].isna()
+        df2.loc[need_w, "width_m"] = df2.loc[need_w, "object_type"].map(DEFAULT_WIDTH_BY_TYPE).fillna(2.0)
+
+    # Compute distance/azimuth where missing
+    for i, r in df2.iterrows():
+        lat = pd.to_numeric(r.get("latitude"), errors="coerce")
+        lon = pd.to_numeric(r.get("longitude"), errors="coerce")
+        if pd.notna(lat) and pd.notna(lon):
+            dx, dy = latlon_to_dxdy_meters(center_lat, center_lon, float(lat), float(lon))
+            if "distance_m" not in df2.columns or pd.isna(r.get("distance_m")):
+                df2.at[i, "distance_m"] = float(math.hypot(dx, dy))
+            if "azimuth_deg" not in df2.columns or pd.isna(r.get("azimuth_deg")):
+                df2.at[i, "azimuth_deg"] = float(bearing_deg_from_dxdy(dx, dy))
+
+    st.session_state[objs_session_key] = df2
+    df_objs = df2
+
 
 # Session-scoped shading & pv (ACTIVE overrides)
 shad_df_key  = _shad_df_key(state)
@@ -621,25 +705,46 @@ with tab_map:
         with c1.expander("Add new object", expanded=False):
             if clicked:
                 st.info(f"Clicked lat/lon: {clicked['lat']:.7f}, {clicked['lng']:.7f}")
+
             new_oid = st.text_input("Object ID", value=f"OBJ_{uuid.uuid4().hex[:6].upper()}")
             new_type = st.selectbox("Type", ["Pole", "Building", "Tree", "Other"], index=0)
-            new_height = st.number_input("Height (m)", min_value=0.0, value=3.0, step=0.5)
-            new_intensity = st.slider("Shading intensity (0-1)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
-            new_lat = st.number_input("Latitude", value=(clicked["lat"] if clicked else center_lat), format="%.7f")
+            new_height = st.number_input("Height (m)", min_value=0.0, value=3.0, step=0.1)
+            new_width  = st.number_input("Width (m)",  min_value=0.0, value=2.0, step=0.1, help="Required by shading model")
+            new_intensity = st.slider("Shading intensity (0–1)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
+
+            new_lat = st.number_input("Latitude",  value=(clicked["lat"] if clicked else center_lat),  format="%.7f")
             new_lon = st.number_input("Longitude", value=(clicked["lng"] if clicked else center_lon), format="%.7f")
+
             if st.button("Add object", key="btn_add_obj"):
-                new_row = {
-                    "object_id": str(new_oid),
-                    "object_type": new_type,
-                    "latitude": float(new_lat),
-                    "longitude": float(new_lon),
-                    "height_m": float(new_height),
-                    "shading_intensity": float(new_intensity),
-                }
-                st.session_state[objs_session_key] = pd.concat([df_objs, pd.DataFrame([new_row])], ignore_index=True)
-                st.session_state[dirty_session_key] = True
-                st.success("Added in session. Use 'Recompute shading' to see impact.")
-                st.rerun()
+                # Compute PV-relative geometry from lat/lon
+                dx, dy = latlon_to_dxdy_meters(center_lat, center_lon, float(new_lat), float(new_lon))
+                new_distance = float(math.hypot(dx, dy))
+                new_azimuth  = float(bearing_deg_from_dxdy(dx, dy))
+
+                # Validate width
+                if new_width <= 0:
+                    st.error("Width (m) must be > 0.")
+                else:
+                    new_row = {
+                        "object_id": str(new_oid),
+                        "object_type": new_type,
+                        "latitude": float(new_lat),
+                        "longitude": float(new_lon),
+                        "height_m": float(new_height),
+                        "width_m": float(new_width),              # <- now explicit
+                        "shading_intensity": float(new_intensity),
+
+                        # required by shading.py
+                        "distance_m": new_distance,
+                        "azimuth_deg": new_azimuth,
+                    }
+                    st.session_state[objs_session_key] = pd.concat(
+                        [df_objs, pd.DataFrame([new_row])], ignore_index=True
+                    )
+                    st.session_state[dirty_session_key] = True
+                    st.success("Added to session. Use 'Recompute shading' to see impact.")
+                    st.rerun()
+
 
         # MOVE
         with c2.expander("Move existing object", expanded=False):
@@ -656,12 +761,26 @@ with tab_map:
                 if st.button("Move object here", key="btn_move_obj"):
                     df2 = df_objs.copy()
                     idx = df2.index[df2["object_id"].astype(str) == sel_oid][0]
+
+                    # Update position
                     df2.at[idx, "latitude"]  = float(new_lat2)
                     df2.at[idx, "longitude"] = float(new_lon2)
+
+                    # Recompute PV-relative geometry
+                    dx, dy = latlon_to_dxdy_meters(center_lat, center_lon, float(new_lat2), float(new_lon2))
+                    df2.at[idx, "distance_m"] = float(math.hypot(dx, dy))
+                    df2.at[idx, "azimuth_deg"] = float(bearing_deg_from_dxdy(dx, dy))
+
+                    # Ensure width_m exists (use default if missing/NaN)
+                    if "width_m" not in df2.columns or pd.isna(df2.at[idx, "width_m"]):
+                        ot = str(df2.at[idx, "object_type"]) if "object_type" in df2.columns else "Other"
+                        df2.at[idx, "width_m"] = float(DEFAULT_WIDTH_BY_TYPE.get(ot, 2.0))
+
                     st.session_state[objs_session_key] = df2
                     st.session_state[dirty_session_key] = True
                     st.success("Moved in session. Use 'Recompute shading' to see impact.")
                     st.rerun()
+
 
         # DELETE
         with c3.expander("Delete object", expanded=False):

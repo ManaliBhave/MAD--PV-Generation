@@ -684,26 +684,137 @@ tab_overview, tab_map, tab_energy, tab_bill, tab_exports, tab_data = st.tabs(
 # -------------------- Overview --------------------------
 with tab_overview:
     st.subheader(f"Summary for {state.title()}")
+
+    # ---- Granularity selector ----
+    granularity = st.radio(
+        "Granularity",
+        ["Hourly", "Daily", "Monthly", "Annual"],
+        index=2,  # default: Monthly (your current behavior)
+        horizontal=True,
+        key="overview_granularity",
+    )
+
+    # Helper: pick time columns already parsed (from your sidebar logic)
+    # ts_hour, ts_month are defined earlier in your script
+    def _ensure_ts(df, ts_guess_func):
+        if df is None or df.empty:
+            return None, None
+        col = guess_time_col(df)
+        ts = parse_ts_column(df, col) if ts_guess_func is None else ts_guess_func
+        return df.copy(), ts
+
+    # Prepare data frames with their timestamps
+    h, th = (None, None)
+    if df_hour is not None and not df_hour.empty:
+        h, th = _ensure_ts(df_hour, ts_hour)
+    m, tm = (None, None)
     if df_month is not None and not df_month.empty:
-        m = df_month.copy()
-        tsm = parse_ts_column(m, guess_time_col(m)) if 'mon_ts_col' not in st.session_state else ts_month
+        m, tm = _ensure_ts(df_month, ts_month)
+
+    # Choose / build the dataset for plotting according to granularity
+    plot_df = None
+    x_label = None
+
+    # Columns we try to plot (energy-based across all granularities)
+    energy_cols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if (m is not None and c in m.columns) or (h is not None and c in h.columns)]
+
+    def _resample_hourly_to(freq):
+        """Resample hourly net to given pandas freq string and sum energies."""
+        if h is None or th is None:
+            return None
+        df = h.copy()
+        df["__ts__"] = th
+        cols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in df.columns]
+        if not cols:
+            return None
+        out = df.set_index("__ts__")[cols].resample(freq).sum(min_count=1).reset_index()
+        return out
+
+    if granularity == "Hourly":
+        if h is not None and th is not None:
+            plot_df = h.copy()
+            plot_df["__ts__"] = th
+            # Prefer energy per hour if present; otherwise fallback to power (kW)
+            ycols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in plot_df.columns]
+            if not ycols:
+                ycols = [c for c in ["PV_P_kW", "Load_kW"] if c in plot_df.columns]
+            if ycols:
+                fig = px.line(plot_df, x="__ts__", y=ycols, title="Energy (Hourly)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Hourly data does not have PV/Load columns to plot.")
+        else:
+            st.info("No hourly data available to show hourly granularity.")
+
+    elif granularity == "Daily":
+        # Prefer resampled hourly → daily; else try monthly collapsed to daily-like labels (not ideal)
+        daily = _resample_hourly_to("D")
+        if daily is not None and not daily.empty:
+            daily["date"] = daily["__ts__"].dt.date
+            fig = px.bar(daily, x="date", y=[c for c in ["PV_E_kWh", "Load_E_kWh"] if c in daily.columns], barmode="group", title="Energy (Daily)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Cannot build daily aggregation (need hourly net file).")
+
+    elif granularity == "Monthly":
+        # Use monthly file when available, else resample hourly → monthly
+        if m is not None and tm is not None:
+            mm = m.copy()
+            mm["__ts__"] = tm
+            cols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in mm.columns]
+            if cols:
+                mm["month"] = mm["__ts__"].dt.strftime("%Y-%m")
+                fig = px.bar(mm, x="month", y=cols, barmode="group", title="Energy (Monthly)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Monthly file lacks PV_E_kWh / Load_E_kWh columns.")
+        else:
+            monthly = _resample_hourly_to("MS")
+            if monthly is not None and not monthly.empty:
+                monthly["month"] = monthly["__ts__"].dt.strftime("%Y-%m")
+                fig = px.bar(monthly, x="month", y=[c for c in ["PV_E_kWh", "Load_E_kWh"] if c in monthly.columns], barmode="group", title="Energy (Monthly)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No monthly or hourly data available to build monthly view.")
+
+    else:  # Annual
+        # Prefer monthly → yearly sum; else resample hourly → monthly → yearly
+        annual_df = None
+        if m is not None and tm is not None:
+            mm = m.copy()
+            mm["__ts__"] = tm
+            cols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in mm.columns]
+            if cols:
+                annual_df = mm.set_index("__ts__")[cols].resample("YS").sum(min_count=1).reset_index()
+        if annual_df is None:
+            monthly = _resample_hourly_to("MS")
+            if monthly is not None and not monthly.empty:
+                cols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in monthly.columns]
+                annual_df = monthly.set_index("__ts__")[cols].resample("YS").sum(min_count=1).reset_index()
+
+        if annual_df is not None and not annual_df.empty:
+            annual_df["year"] = annual_df["__ts__"].dt.year
+            fig = px.bar(annual_df, x="year", y=[c for c in ["PV_E_kWh", "Load_E_kWh"] if c in annual_df.columns], barmode="group", title="Energy (Annual)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No data available to build annual view.")
+
+    # ---- Keep your bill waterfall as-is (overall totals) ----
+    if df_month is not None and not df_month.empty:
+        m2 = df_month.copy()
+        tsm = parse_ts_column(m2, guess_time_col(m2)) if 'mon_ts_col' not in st.session_state else ts_month
         if tsm is None:
             st.warning("Could not parse a timestamp column in monthly data. Choose it in the sidebar (Advanced • Timestamp columns).")
         else:
-            m["month"] = tsm.dt.strftime("%Y-%m")
-            ycols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in m.columns]
-            if ycols:
-                fig = px.bar(m, x="month", y=ycols, barmode="group", title="Monthly Energy")
-                st.plotly_chart(fig, use_container_width=True)
-
-            buy  = pd.to_numeric(m.get("Buy_$", 0), errors="coerce").fillna(0).sum()
-            sell = pd.to_numeric(m.get("Sell_$", 0), errors="coerce").fillna(0).sum()
-            net  = pd.to_numeric(m.get("NetBill_$", 0), errors="coerce").fillna(0).sum()
+            buy  = pd.to_numeric(m2.get("Buy_$", 0), errors="coerce").fillna(0).sum()
+            sell = pd.to_numeric(m2.get("Sell_$", 0), errors="coerce").fillna(0).sum()
+            net  = pd.to_numeric(m2.get("NetBill_$", 0), errors="coerce").fillna(0).sum()
             baseline = ak.get("baseline_bill_est", 0.0)
             figw = make_bill_waterfall(baseline, buy, sell, net)
             st.plotly_chart(figw, use_container_width=True)
     else:
         st.info("Monthly net metering file not found for this state.")
+
 
 # -------------------- Map & Shading ---------------------
 with tab_map:
@@ -950,67 +1061,422 @@ with tab_map:
 # -------------------- Energy Profiles -------------------
 with tab_energy:
     st.subheader("Energy Production & Load")
-    if df_hour is not None and not df_hour.empty:
-        h = df_hour.copy()
-        if ts_hour is None:
-            st.warning("Could not parse a timestamp column in hourly data. Choose it in the sidebar (Advanced • Timestamp columns).")
-        else:
-            h["__ts__"] = ts_hour
-            ycols = [c for c in ["PV_P_kW", "Load_kW"] if c in h.columns]
-            if ycols:
-                fig = px.line(h, x="__ts__", y=ycols, title="Power (kW)")
-                st.plotly_chart(fig, use_container_width=True)
 
-            value_col = "PV_E_kWh" if "PV_E_kWh" in h.columns else ("PV_P_kW" if "PV_P_kW" in h.columns else None)
-            if value_col:
-                pv = h[["__ts__", value_col]].copy()
+    # ---- Granularity selector ----
+    gran_energy = st.radio(
+        "Granularity",
+        ["Hourly", "Daily", "Monthly", "Annual"],
+        index=0,  # default Hourly here
+        horizontal=True,
+        key="energy_granularity",
+    )
+
+    # ---- Parse hourly & monthly timestamps (prefer existing parsed vars) ----
+    def _ensure_ts(df, ts_parsed):
+        if df is None or df.empty:
+            return None, None
+        ts = ts_parsed
+        if ts is None:
+            col = guess_time_col(df)
+            ts = parse_ts_column(df, col)
+        if ts is None:
+            return None, None
+        out = df.copy()
+        out["__ts__"] = ts
+        return out, ts
+
+    H, TH = _ensure_ts(df_hour, ts_hour)
+    M, TM = _ensure_ts(df_month, ts_month)
+
+    if H is None or TH is None:
+        st.info("Hourly net file not found or timestamp not parseable.")
+    else:
+        # ---- Time range defaults by granularity ----
+        tmin = pd.Timestamp(TH.min()).to_pydatetime()
+        tmax = pd.Timestamp(TH.max()).to_pydatetime()
+
+        if gran_energy == "Hourly":
+            default_len = pd.Timedelta(days=7)
+            step = pd.Timedelta(hours=1)
+        elif gran_energy == "Daily":
+            default_len = pd.Timedelta(days=21)
+            step = pd.Timedelta(days=1)
+        elif gran_energy == "Monthly":
+            default_len = pd.Timedelta(days=365)
+            step = pd.Timedelta(days=1)
+        else:  # Annual
+            default_len = (tmax - tmin)
+            step = pd.Timedelta(days=1)
+
+        dstart = max(pd.Timestamp(tmax) - default_len, pd.Timestamp(tmin)).to_pydatetime()
+        dend   = tmax
+
+        tr_start, tr_end = st.slider(
+            "Time range",
+            min_value=tmin,
+            max_value=tmax,
+            value=(dstart, dend),
+            step=step,
+            format="YYYY-MM-DD HH:mm" if gran_energy == "Hourly" else "YYYY-MM-DD",
+            key=f"energy_range_{gran_energy}",
+        )
+
+        # Mask on hourly for precise slicing
+        maskH = (H["__ts__"] >= pd.Timestamp(tr_start)) & (H["__ts__"] <= pd.Timestamp(tr_end))
+        Hs = H.loc[maskH].copy()
+
+        energy_cols = ["PV_E_kWh", "Load_E_kWh"]
+        power_cols  = ["PV_P_kW", "Load_kW"]
+
+        # ---- Plot logic per granularity ----
+        if gran_energy == "Hourly":
+            # Prefer Power (kW) at hourly resolution; if missing, use energy columns
+            ycols = [c for c in power_cols if c in Hs.columns]
+            title = "Power (Hourly, kW)"
+            if not ycols:
+                ycols = [c for c in energy_cols if c in Hs.columns]
+                title = "Energy (Hourly, kWh)"
+            if ycols:
+                fig = px.line(Hs, x="__ts__", y=ycols, title=title)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Hourly data lacks PV/Load power or energy columns.")
+
+            # Heatmap (PV only) inside selected range
+            value_col = "PV_E_kWh" if "PV_E_kWh" in Hs.columns else ("PV_P_kW" if "PV_P_kW" in Hs.columns else None)
+            if value_col and not Hs.empty:
+                pv = Hs[["__ts__", value_col]].copy()
                 pv["date"] = pv["__ts__"].dt.date
                 pv["hour"] = pv["__ts__"].dt.hour
                 heat = pv.pivot_table(index="hour", columns="date", values=value_col, aggfunc="sum")
                 st.dataframe(heat)
-                st.caption("Tip: replace with a heatmap chart if desired.")
+                st.caption("Hourly PV heatmap (filtered to selected window).")
             else:
-                st.info("PV column not found for heatmap (looked for PV_E_kWh / PV_P_kW).")
-    else:
-        st.info("Hourly net file not found for this state.")
+                st.caption("No PV column available for heatmap in the selected window.")
+
+        elif gran_energy == "Daily":
+            cols = [c for c in energy_cols if c in Hs.columns]
+            if not cols:
+                st.info("Hourly data lacks PV_E_kWh / Load_E_kWh for daily aggregation.")
+            else:
+                daily = Hs.set_index("__ts__")[cols].resample("D").sum(min_count=1).reset_index()
+                daily["date"] = daily["__ts__"].dt.date
+                fig = px.bar(daily, x="date", y=cols, barmode="group", title="Energy (Daily)")
+                st.plotly_chart(fig, use_container_width=True)
+
+        elif gran_energy == "Monthly":
+            cols = [c for c in energy_cols if c in Hs.columns]
+            if not cols:
+                st.info("Hourly data lacks PV_E_kWh / Load_E_kWh for monthly aggregation.")
+            else:
+                monthly = Hs.set_index("__ts__")[cols].resample("MS").sum(min_count=1).reset_index()
+                monthly["month"] = monthly["__ts__"].dt.strftime("%Y-%m")
+                fig = px.bar(monthly, x="month", y=cols, barmode="group", title="Energy (Monthly)")
+                st.plotly_chart(fig, use_container_width=True)
+
+        else:  # Annual
+            cols = [c for c in energy_cols if c in Hs.columns]
+            if not cols:
+                st.info("Hourly data lacks PV_E_kWh / Load_E_kWh for annual aggregation.")
+            else:
+                monthly = Hs.set_index("__ts__")[cols].resample("MS").sum(min_count=1)
+                annual  = monthly.resample("YS").sum(min_count=1).reset_index()
+                annual["year"] = annual["__ts__"].dt.year
+                fig = px.bar(annual, x="year", y=cols, barmode="group", title="Energy (Annual)")
+                st.plotly_chart(fig, use_container_width=True)
+
 
 # -------------------- Billing ---------------------------
 with tab_bill:
     st.subheader("Billing & Savings")
-    if df_month is not None and not df_month.empty:
-        m = df_month.copy()
-        if ts_month is None:
-            st.warning("Could not parse a timestamp column in monthly data. Choose it in the sidebar (Advanced • Timestamp columns).")
-        else:
-            m["month"] = ts_month.dt.strftime("%Y-%m")
-            cols = [c for c in ["Buy_$", "Sell_$", "NetBill_$"] if c in m.columns]
-            if cols:
-                fig = px.bar(m, x="month", y=cols, barmode="group", title="Monthly Costs")
-                st.plotly_chart(fig, use_container_width=True)
 
-            table_cols = ["month"]
-            table_cols += [c for c in ["Import_kWh", "Export_kWh", "Buy_$", "Sell_$", "NetBill_$"] if c in m.columns]
-            st.dataframe(m[table_cols])
+    gran_bill = st.radio(
+        "Granularity",
+        ["Hourly", "Daily", "Monthly", "Annual"],
+        index=2,  # default Monthly
+        horizontal=True,
+        key="billing_granularity",
+    )
+
+    # Helper: ensure df has a parsed ts column named __ts__
+    def _ensure_ts(df, ts_parsed):
+        if df is None or df.empty:
+            return None, None
+        ts = ts_parsed
+        if ts is None:
+            col = guess_time_col(df)
+            ts = parse_ts_column(df, col)
+        if ts is None:
+            return None, None
+        out = df.copy()
+        out["__ts__"] = ts
+        return out, ts
+
+    H, TH = _ensure_ts(df_hour, ts_hour)
+    M, TM = _ensure_ts(df_month, ts_month)
+
+    if M is None or TM is None:
+        st.info("Monthly net metering file not found or timestamp not parseable.")
     else:
-        st.info("Monthly net metering file not found for this state.")
+        # Infer average buy/sell rates from MONTHLY if available
+        def _infer_rates(dfm):
+            try:
+                tot_import = pd.to_numeric(dfm.get("Import_kWh", 0), errors="coerce").sum()
+                tot_export = pd.to_numeric(dfm.get("Export_kWh", 0), errors="coerce").sum()
+                tot_buy = pd.to_numeric(dfm.get("Buy_$", 0), errors="coerce").sum()
+                tot_sell = pd.to_numeric(dfm.get("Sell_$", 0), errors="coerce").sum()
+                buy_rate  = float(tot_buy / tot_import) if tot_import and tot_import > 0 else None
+                sell_rate = float(tot_sell / tot_export) if tot_export and tot_export > 0 else None
+                return buy_rate, sell_rate
+            except Exception:
+                return None, None
+
+        buy_rate, sell_rate = _infer_rates(M)
+
+        # Time range defaults per granularity
+        tmin = pd.Timestamp(TM.min()).to_pydatetime()
+        tmax = pd.Timestamp(TM.max()).to_pydatetime()
+
+        if gran_bill == "Hourly":
+            if H is None or TH is None:
+                st.warning("Hourly data not available; switching to Monthly view.")
+                gran_bill = "Monthly"
+                tmin = pd.Timestamp(TM.min()).to_pydatetime()
+                tmax = pd.Timestamp(TM.max()).to_pydatetime()
+                default_len = pd.Timedelta(days=365)
+                step = pd.Timedelta(days=1)
+            else:
+                tmin = pd.Timestamp(TH.min()).to_pydatetime()
+                tmax = pd.Timestamp(TH.max()).to_pydatetime()
+                default_len = pd.Timedelta(days=7)
+                step = pd.Timedelta(hours=1)
+        elif gran_bill == "Daily":
+            default_len = pd.Timedelta(days=21)
+            step = pd.Timedelta(days=1)
+        elif gran_bill == "Monthly":
+            default_len = pd.Timedelta(days=365)
+            step = pd.Timedelta(days=1)
+        else:  # Annual
+            default_len = (tmax - tmin)
+            step = pd.Timedelta(days=1)
+
+        dstart = max(pd.Timestamp(tmax) - default_len, pd.Timestamp(tmin)).to_pydatetime()
+        dend   = tmax
+
+        tr_start, tr_end = st.slider(
+            "Time range",
+            min_value=tmin,
+            max_value=tmax,
+            value=(dstart, dend),
+            step=step,
+            format="YYYY-MM-DD HH:mm" if gran_bill == "Hourly" else "YYYY-MM-DD",
+            key=f"billing_range_{gran_bill}",
+        )
+
+        # Plot per granularity (no tables)
+        if gran_bill == "Hourly":
+            if H is None or TH is None:
+                st.info("Hourly data not available.")
+            else:
+                maskH = (H["__ts__"] >= pd.Timestamp(tr_start)) & (H["__ts__"] <= pd.Timestamp(tr_end))
+                Hs = H.loc[maskH].copy()
+
+                for c in ["Import_kWh", "Export_kWh"]:
+                    if c not in Hs.columns: Hs[c] = 0.0
+
+                if "Buy_$" not in Hs.columns and buy_rate is not None:
+                    Hs["Buy_$"] = pd.to_numeric(Hs["Import_kWh"], errors="coerce").fillna(0.0) * buy_rate
+                if "Sell_$" not in Hs.columns and sell_rate is not None:
+                    Hs["Sell_$"] = pd.to_numeric(Hs["Export_kWh"], errors="coerce").fillna(0.0) * sell_rate
+
+                cols = [c for c in ["Buy_$", "Sell_$"] if c in Hs.columns]
+                if cols:
+                    Hs["NetBill_$"] = Hs.get("Buy_$", 0).fillna(0) - Hs.get("Sell_$", 0).fillna(0)
+                    cols_plot = cols + (["NetBill_$"] if "NetBill_$" in Hs.columns else [])
+                    fig = px.line(Hs, x="__ts__", y=cols_plot, title="Billing (Hourly)")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Cannot compute Hourly costs (Buy_$ / Sell_$ not found and rates unavailable).")
+
+        elif gran_bill == "Daily":
+            if H is None or TH is None:
+                st.info("Hourly data not available to build Daily billing.")
+            else:
+                maskH = (H["__ts__"] >= pd.Timestamp(tr_start)) & (H["__ts__"] <= pd.Timestamp(tr_end))
+                Hs = H.loc[maskH].copy()
+
+                for c in ["Import_kWh", "Export_kWh"]:
+                    if c not in Hs.columns: Hs[c] = 0.0
+
+                daily = Hs.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("D").sum(min_count=1)
+                if buy_rate is not None:
+                    daily["Buy_$"] = daily["Import_kWh"] * buy_rate
+                if sell_rate is not None:
+                    daily["Sell_$"] = daily["Export_kWh"] * sell_rate
+                if "Buy_$" in daily.columns or "Sell_$" in daily.columns:
+                    daily["NetBill_$"] = daily.get("Buy_$", 0) - daily.get("Sell_$", 0)
+
+                daily = daily.reset_index()
+                daily["date"] = daily["__ts__"].dt.date
+
+                cols = [c for c in ["Buy_$", "Sell_$", "NetBill_$"] if c in daily.columns]
+                if cols:
+                    fig = px.bar(daily, x="date", y=cols, barmode="group", title="Billing (Daily)")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Daily costs unavailable (rates missing and no cost columns found).")
+
+        elif gran_bill == "Monthly":
+            Ms = M[(M["__ts__"] >= pd.Timestamp(tr_start)) & (M["__ts__"] <= pd.Timestamp(tr_end))].copy()
+            Ms["month"] = Ms["__ts__"].dt.strftime("%Y-%m")
+            cols = [c for c in ["Buy_$", "Sell_$", "NetBill_$"] if c in Ms.columns]
+            if cols:
+                fig = px.bar(Ms, x="month", y=cols, barmode="group", title="Billing (Monthly)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Monthly file lacks Buy_$ / Sell_$ / NetBill_$ columns.")
+
+        else:  # Annual
+            Ms = M[(M["__ts__"] >= pd.Timestamp(tr_start)) & (M["__ts__"] <= pd.Timestamp(tr_end))].copy()
+            cols = [c for c in ["Buy_$", "Sell_$", "NetBill_$"] if c in Ms.columns]
+            if cols:
+                Y = Ms.set_index("__ts__")[cols].resample("YS").sum(min_count=1).reset_index()
+                Y["year"] = Y["__ts__"].dt.year
+                fig = px.bar(Y, x="year", y=cols, barmode="group", title="Billing (Annual)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No cost columns available to build Annual billing view.")
+
+
 
 # -------------------- Export / Import -------------------
 with tab_exports:
-    st.subheader("Import vs Export (Hourly)")
-    if df_hour is not None and not df_hour.empty:
-        h = df_hour.copy()
-        if ts_hour is None:
-            st.warning("Could not parse a timestamp column in hourly data. Choose it in the sidebar (Advanced • Timestamp columns).")
-        else:
-            h["__ts__"] = ts_hour
-            ycols = [c for c in ["Import_kWh", "Export_kWh"] if c in h.columns]
+    st.subheader("Import vs Export")
+
+    gran_ie = st.radio(
+        "Granularity",
+        ["Hourly", "Daily", "Monthly", "Annual"],
+        index=0,  # default Hourly
+        horizontal=True,
+        key="imp_exp_granularity",
+    )
+
+    # Helper: ensure df has a parsed ts column named __ts__
+    def _ensure_ts(df, ts_parsed):
+        if df is None or df.empty:
+            return None, None
+        ts = ts_parsed
+        if ts is None:
+            col = guess_time_col(df)
+            ts = parse_ts_column(df, col)
+        if ts is None:
+            return None, None
+        out = df.copy()
+        out["__ts__"] = ts
+        return out, ts
+
+    H, TH = _ensure_ts(df_hour, ts_hour)
+    M, TM = _ensure_ts(df_month, ts_month)
+
+    if H is None or TH is None:
+        st.info("Hourly net file not found or timestamp not parseable.")
+    else:
+        # Time range defaults per granularity
+        def _bounds(df_ts):
+            return pd.Timestamp(df_ts.min()).to_pydatetime(), pd.Timestamp(df_ts.max()).to_pydatetime()
+
+        # Base bounds from hourly (most complete)
+        tminH, tmaxH = _bounds(TH)
+
+        if gran_ie == "Hourly":
+            default_len = pd.Timedelta(days=7)
+            step = pd.Timedelta(hours=1)
+            slider_min, slider_max = tminH, tmaxH
+
+        elif gran_ie == "Daily":
+            default_len = pd.Timedelta(days=21)
+            step = pd.Timedelta(days=1)
+            slider_min, slider_max = tminH, tmaxH
+
+        elif gran_ie == "Monthly":
+            # Prefer monthly bounds if available
+            if M is not None and TM is not None:
+                slider_min, slider_max = _bounds(TM)
+            else:
+                slider_min, slider_max = tminH, tmaxH
+            default_len = pd.Timedelta(days=365)
+            step = pd.Timedelta(days=1)
+
+        else:  # Annual
+            if M is not None and TM is not None:
+                slider_min, slider_max = _bounds(TM)
+            else:
+                slider_min, slider_max = tminH, tmaxH
+            default_len = (pd.Timestamp(slider_max) - pd.Timestamp(slider_min))
+            step = pd.Timedelta(days=1)
+
+        dstart = max(pd.Timestamp(slider_max) - default_len, pd.Timestamp(slider_min)).to_pydatetime()
+        dend   = slider_max
+
+        tr_start, tr_end = st.slider(
+            "Time range",
+            min_value=slider_min,
+            max_value=slider_max,
+            value=(dstart, dend),
+            step=step,
+            format="YYYY-MM-DD HH:mm" if gran_ie == "Hourly" else "YYYY-MM-DD",
+            key=f"imp_exp_range_{gran_ie}",
+        )
+
+        # Ensure columns exist
+        for c in ["Import_kWh", "Export_kWh"]:
+            if c not in H.columns:
+                H[c] = 0.0
+
+        # Plot per granularity
+        if gran_ie == "Hourly":
+            Hs = H[(H["__ts__"] >= pd.Timestamp(tr_start)) & (H["__ts__"] <= pd.Timestamp(tr_end))].copy()
+            ycols = [c for c in ["Import_kWh", "Export_kWh"] if c in Hs.columns]
             if ycols:
-                fig = px.area(h, x="__ts__", y=ycols, title="Import/Export Energy (kWh)")
+                fig = px.area(Hs, x="__ts__", y=ycols, title="Import/Export Energy (Hourly kWh)")
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Hourly file lacks Import_kWh / Export_kWh columns.")
-    else:
-        st.info("Hourly net file not found for this state.")
+
+        elif gran_ie == "Daily":
+            Hs = H[(H["__ts__"] >= pd.Timestamp(tr_start)) & (H["__ts__"] <= pd.Timestamp(tr_end))].copy()
+            daily = Hs.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("D").sum(min_count=1).reset_index()
+            daily["date"] = daily["__ts__"].dt.date
+            fig = px.area(daily, x="date", y=["Import_kWh", "Export_kWh"], title="Import/Export Energy (Daily kWh)")
+            st.plotly_chart(fig, use_container_width=True)
+
+        elif gran_ie == "Monthly":
+            if M is not None and TM is not None and all(c in M.columns for c in ["Import_kWh", "Export_kWh"]):
+                Ms = M[(M["__ts__"] >= pd.Timestamp(tr_start)) & (M["__ts__"] <= pd.Timestamp(tr_end))].copy()
+                Ms["month"] = Ms["__ts__"].dt.strftime("%Y-%m")
+                fig = px.area(Ms, x="month", y=["Import_kWh", "Export_kWh"], title="Import/Export Energy (Monthly kWh)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                # Fallback: build monthly from hourly
+                Hs = H[(H["__ts__"] >= pd.Timestamp(tr_start)) & (H["__ts__"] <= pd.Timestamp(tr_end))].copy()
+                mon = Hs.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("MS").sum(min_count=1).reset_index()
+                mon["month"] = mon["__ts__"].dt.strftime("%Y-%m")
+                fig = px.area(mon, x="month", y=["Import_kWh", "Export_kWh"], title="Import/Export Energy (Monthly kWh)")
+                st.plotly_chart(fig, use_container_width=True)
+
+        else:  # Annual
+            # Prefer monthly rollups if present; otherwise aggregate hourly to years
+            if M is not None and TM is not None and all(c in M.columns for c in ["Import_kWh", "Export_kWh"]):
+                Ms = M[(M["__ts__"] >= pd.Timestamp(tr_start)) & (M["__ts__"] <= pd.Timestamp(tr_end))].copy()
+                Y = Ms.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("YS").sum(min_count=1).reset_index()
+            else:
+                Hs = H[(H["__ts__"] >= pd.Timestamp(tr_start)) & (H["__ts__"] <= pd.Timestamp(tr_end))].copy()
+                Y = Hs.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("YS").sum(min_count=1).reset_index()
+
+            Y["year"] = Y["__ts__"].dt.year
+            fig = px.bar(Y, x="year", y=["Import_kWh", "Export_kWh"], barmode="group", title="Import/Export Energy (Annual kWh)")
+            st.plotly_chart(fig, use_container_width=True)
+
 
 # -------------------- Data (debug) ----------------------
 with tab_data:

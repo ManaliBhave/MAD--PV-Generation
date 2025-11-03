@@ -37,7 +37,17 @@ SITES = {
 DEFAULT_BUY  = 0.20  # import from grid
 DEFAULT_SELL = 0.08  # export credit
 TARIFFS = {
-    # "california": {"buy": 0.28, "sell": 0.08},
+    "california":      {"buy": 0.30, "sell": 0.15},
+    "north_carolinas": {"buy": 0.13, "sell": 0.065},
+    "texas":           {"buy": 0.14, "sell": 0.070},
+    "north_dakota":    {"buy": 0.11, "sell": 0.055},
+    "colorado":        {"buy": 0.14, "sell": 0.070},
+    "michigan":        {"buy": 0.19, "sell": 0.095},
+    "maine":           {"buy": 0.28, "sell": 0.140},
+    "washington":      {"buy": 0.11, "sell": 0.055},
+    "missouri":        {"buy": 0.13, "sell": 0.065},
+    "nevada":          {"buy": 0.16, "sell": 0.080},
+    "florida":         {"buy": 0.15, "sell": 0.075},
 }
 
 # ----------------------------

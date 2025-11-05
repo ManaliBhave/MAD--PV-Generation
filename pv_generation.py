@@ -17,7 +17,7 @@ panel_azimuth = 180              # south-facing in northern hemisphere
 # LOAD DATA
 # ----------------------------
 # Example: Replace 'your_file.csv' with your dataset
-df = pd.read_csv("solcast_5yr_hybrid_forecast.csv")
+df = pd.read_csv("solcast.csv")
 
 # Ensure correct data types
 df['period_end'] = pd.to_datetime(df['period_end'])
@@ -76,6 +76,6 @@ df['E_kWh'] = df['P_actual'] * interval_hours
 print(df[['period_end', 'E_poa', 'T_cell', 'P_actual', 'E_kWh']].head())
 
 # Optionally save to file
-df.to_csv("pv_generation_results_5y.csv", index=False)
-print("\nSaved results → pv_generation_results_5y.csv")
+df.to_csv("pv_generation_results.csv", index=False)
+print("\nSaved results → pv_generation_results.csv")
  

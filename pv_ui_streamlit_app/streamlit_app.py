@@ -22,7 +22,7 @@ from kpi_utils import annualize_monthly, shading_kpis
 
 # make assistant importable if the app is inside pv_ui_streamlit_app/
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from assistant.assistant_tab import render as render_assistant
+# from assistant.assistant_tab import render as render_assistant
 
 # ---------------------------------------------------------------------
 # Streamlit Page
@@ -1429,7 +1429,7 @@ with tab_data:
     else:
         st.caption("No hourly net csv found or it is empty.")
 
-# -------------------- Assistant -------------------------
-with tab_assistant:
-    dfs = {"hour": df_hour, "month": df_month}  # pass what you've loaded
-    render_assistant(dfs)
+# # -------------------- Assistant -------------------------
+# with tab_assistant:
+#     dfs = {"hour": df_hour, "month": df_month}  # pass what you've loaded
+#     render_assistant(dfs)

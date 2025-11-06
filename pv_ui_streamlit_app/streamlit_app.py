@@ -497,7 +497,7 @@ ts_pv    = parse_ts_column(df_pv_active,    pv_col) if df_pv_active   is not Non
 # ------------------ Global time range (date inputs, no slider) ------------------
 from datetime import datetime, time as dtime
 
-st.markdown("### Global time range (applies to all pages)")
+st.markdown("### Time Range")
 
 def _bounds_from_any(df_list, ts_list):
     """Find min/max timestamp across all available dataframes."""
@@ -844,8 +844,8 @@ else:
     avg_shade = float("nan")
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Annual PV (kWh)", f"{ak.get('annual_pv_kwh',0):,.0f}")
-c2.metric("Annual Load (kWh)", f"{ak.get('annual_load_kwh',0):,.0f}")
+c1.metric("Total PV (kWh)", f"{ak.get('annual_pv_kwh',0):,.0f}")
+c2.metric("Total Load (kWh)", f"{ak.get('annual_load_kwh',0):,.0f}")
 c3.metric("Self-consumption (%)", f"{ak.get('self_consumption_pct',0):.1f}%")
 c4.metric("Savings (est)", f"${ak.get('savings_est',0):,.0f}")
 c5.metric("Avg Shading Loss", ("—" if np.isnan(avg_shade) else f"{avg_shade:.1f}%"))

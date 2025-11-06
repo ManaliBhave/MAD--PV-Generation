@@ -563,12 +563,24 @@ st.caption(f"Active range: **{g_start.date()} → {g_end.date()}**")
 
 # Small helper used later (unchanged if you already have it)
 def filter_df_by_global(df, ts, start_ts, end_ts):
+    """
+    Return a copy of df filtered to [start_ts, end_ts] and always include
+    a datetime column '__ts__' aligned to the returned rows.
+    """
     if df is None or df.empty or ts is None:
-        return df
+        return None  # signal unusable
+
     s = pd.to_datetime(ts, errors="coerce")
+    if s.isna().all():
+        return None
+
     mask = (s >= start_ts) & (s <= end_ts)
     out = df.loc[mask].copy()
+
+    # attach helper timestamp column aligned by index
+    out["__ts__"] = s.loc[mask].values
     return out
+
 
 # ---- render the single, global time range slider ----
 # g_start, g_end = render_global_time_filter(ts_hour, ts_month)
@@ -705,6 +717,13 @@ if st.sidebar.button("End session (clean temp)"):
 Hf = filter_df_by_global(df_hour,  ts_hour,  g_start, g_end)
 Mf = filter_df_by_global(df_month, ts_month, g_start, g_end)
 Sf = filter_df_by_global(df_shad_active, ts_shad, g_start, g_end)
+
+# Early guards so later code never crashes:
+if Mf is not None and "__ts__" not in Mf.columns:
+    Mf = None
+if Hf is not None and "__ts__" not in Hf.columns:
+    Hf = None
+
 
 def _num(s):
     if s is None:
@@ -888,7 +907,7 @@ with tab_overview:
             st.info("Cannot build daily aggregation (need hourly net file).")
 
     elif granularity == "Monthly":
-        if Mf is not None and not Mf.empty:
+        if Mf is not None and not Mf.empty and "__ts__" in Mf.columns:
             mm = Mf.copy()
             cols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in mm.columns]
             if cols:

@@ -228,7 +228,7 @@ def run_ai_chatbot():
                         f"pd.read_csv(r'{safe_path}')",
                         code
                     )
-                    st.info(f"📂 Fixed path for '{fname}' → {safe_path}")
+                    # st.info(f"📂 Fixed path for '{fname}' → {safe_path}")
                 else:
                     st.warning(f"⚠️ Could not find CSV: {fname}")
  

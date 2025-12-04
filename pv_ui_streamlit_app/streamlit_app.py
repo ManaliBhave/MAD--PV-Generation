@@ -458,7 +458,7 @@ if not STATES:
     st.error("No datasets found. Set PV_DATA_BASE env var or place this app next to your 'main' data folder.")
     st.stop()
 
-st.sidebar.title("Shady")
+st.sidebar.title("Solarity")
 
 def panel_label(s: str) -> str:
     # shows "Texas - Panel", "California - Panel", etc.
@@ -630,14 +630,14 @@ st.sidebar.subheader("Time Range")
  
 start_date = st.sidebar.date_input(
     "Start date",
-    value=st.session_state[gkey_start],
+    value=datetime(2025, 12, 1).date(),  #st.session_state[gkey_start],
     min_value=all_min.date(),
     max_value=all_max.date(),
     key="date_input_start"
 )
 end_date = st.sidebar.date_input(
     "End date",
-    value=st.session_state[gkey_end],
+    value=datetime(2025, 12, 15).date(),   #st.session_state[gkey_end],
     min_value=all_min.date(),
     max_value=all_max.date(),
     key="date_input_end"
@@ -964,8 +964,8 @@ with tab_overview:
     st.markdown("### Energy")
     gran_energy = st.radio(
         "Granularity (Energy)",
-        ["Hourly", "Daily", "Monthly", "Annual"],
-        index=2,  # default Monthly
+        ["Hourly", "Daily"], # , "Monthly", "Annual"
+        index=1,  # default Monthly
         horizontal=True,
         key="overview_energy_granularity",
     )
@@ -1004,51 +1004,51 @@ with tab_overview:
         else:
             st.info("Cannot build daily aggregation.")
 
-    elif gran_energy == "Monthly":
-        if Mf is not None and not Mf.empty and "__ts__" in Mf.columns:
-            mm = Mf.copy()
-            cols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in mm.columns]
-            if cols:
-                mm["month"] = mm["__ts__"].dt.strftime("%Y-%m")
-                fig = px.bar(mm, x="month", y=cols, barmode="group", title="Energy (Monthly)")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Monthly file lacks PV_E_kWh / Load_E_kWh columns.")
-        else:
-            monthly = _resample_hourly(Hf, "MS")
-            if monthly is not None and not monthly.empty:
-                monthly["month"] = monthly["__ts__"].dt.strftime("%Y-%m")
-                fig = px.bar(monthly, x="month", y=[c for c in ["PV_E_kWh","Load_E_kWh"] if c in monthly.columns],
-                             barmode="group", title="Energy (Monthly)")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No data available to build monthly view.")
+    # elif gran_energy == "Monthly":
+    #     if Mf is not None and not Mf.empty and "__ts__" in Mf.columns:
+    #         mm = Mf.copy()
+    #         cols = [c for c in ["PV_E_kWh", "Load_E_kWh"] if c in mm.columns]
+    #         if cols:
+    #             mm["month"] = mm["__ts__"].dt.strftime("%Y-%m")
+    #             fig = px.bar(mm, x="month", y=cols, barmode="group", title="Energy (Monthly)")
+    #             st.plotly_chart(fig, use_container_width=True)
+    #         else:
+    #             st.info("Monthly file lacks PV_E_kWh / Load_E_kWh columns.")
+    #     else:
+    #         monthly = _resample_hourly(Hf, "MS")
+    #         if monthly is not None and not monthly.empty:
+    #             monthly["month"] = monthly["__ts__"].dt.strftime("%Y-%m")
+    #             fig = px.bar(monthly, x="month", y=[c for c in ["PV_E_kWh","Load_E_kWh"] if c in monthly.columns],
+    #                          barmode="group", title="Energy (Monthly)")
+    #             st.plotly_chart(fig, use_container_width=True)
+    #         else:
+    #             st.info("No data available to build monthly view.")
 
-    else:  # Annual
-        annual_df = None
-        if Mf is not None and not Mf.empty:
-            cols = [c for c in ["PV_E_kWh","Load_E_kWh"] if c in Mf.columns]
-            if cols:
-                annual_df = Mf.set_index("__ts__")[cols].resample("YS").sum(min_count=1).reset_index()
-        if annual_df is None and Hf is not None and not Hf.empty:
-            cols = [c for c in ["PV_E_kWh","Load_E_kWh"] if c in Hf.columns]
-            if cols:
-                monthly = Hf.set_index("__ts__")[cols].resample("MS").sum(min_count=1)
-                annual_df = monthly.resample("YS").sum(min_count=1).reset_index()
-        if annual_df is not None and not annual_df.empty:
-            annual_df["year"] = annual_df["__ts__"].dt.year
-            fig = px.bar(annual_df, x="year", y=[c for c in ["PV_E_kWh","Load_E_kWh"] if c in annual_df.columns],
-                         barmode="group", title="Energy (Annual)")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No data available to build annual view.")
+    # else:  # Annual
+    #     annual_df = None
+    #     if Mf is not None and not Mf.empty:
+    #         cols = [c for c in ["PV_E_kWh","Load_E_kWh"] if c in Mf.columns]
+    #         if cols:
+    #             annual_df = Mf.set_index("__ts__")[cols].resample("YS").sum(min_count=1).reset_index()
+    #     if annual_df is None and Hf is not None and not Hf.empty:
+    #         cols = [c for c in ["PV_E_kWh","Load_E_kWh"] if c in Hf.columns]
+    #         if cols:
+    #             monthly = Hf.set_index("__ts__")[cols].resample("MS").sum(min_count=1)
+    #             annual_df = monthly.resample("YS").sum(min_count=1).reset_index()
+    #     if annual_df is not None and not annual_df.empty:
+    #         annual_df["year"] = annual_df["__ts__"].dt.year
+    #         fig = px.bar(annual_df, x="year", y=[c for c in ["PV_E_kWh","Load_E_kWh"] if c in annual_df.columns],
+    #                      barmode="group", title="Energy (Annual)")
+    #         st.plotly_chart(fig, use_container_width=True)
+    #     else:
+    #         st.info("No data available to build annual view.")
 
     # ==== BILLING (moved here) ========================================
     st.markdown("### Billing & Savings")
     gran_bill = st.radio(
         "Granularity (Billing)",
-        ["Hourly", "Daily", "Monthly", "Annual"],
-        index=2,  # default Monthly
+        ["Hourly", "Daily"], # "Monthly", "Annual"
+        index=1,  # default Monthly
         horizontal=True,
         key="overview_billing_granularity",
     )
@@ -1103,16 +1103,16 @@ with tab_overview:
                 fig = px.bar(daily, x="date", y=cols, barmode="group", title="Billing (Daily)")
                 st.plotly_chart(fig, use_container_width=True)
 
-    elif gran_bill == "Monthly":
-        if Mf is None or Mf.empty:
-            st.info("No monthly data.")
-        else:
-            Ms = Mf.copy()
-            Ms["month"] = Ms["__ts__"].dt.strftime("%Y-%m")
-            cols = [c for c in ["Buy_$", "Sell_$", "NetBill_$"] if c in Ms.columns]
-            if cols:
-                fig = px.bar(Ms, x="month", y=cols, barmode="group", title="Billing (Monthly)")
-                st.plotly_chart(fig, use_container_width=True)
+    # elif gran_bill == "Monthly":
+    #     if Mf is None or Mf.empty:
+    #         st.info("No monthly data.")
+    #     else:
+    #         Ms = Mf.copy()
+    #         Ms["month"] = Ms["__ts__"].dt.strftime("%Y-%m")
+    #         cols = [c for c in ["Buy_$", "Sell_$", "NetBill_$"] if c in Ms.columns]
+    #         if cols:
+    #             fig = px.bar(Ms, x="month", y=cols, barmode="group", title="Billing (Monthly)")
+    #             st.plotly_chart(fig, use_container_width=True)
 
             # Waterfall + savings card
             # buy  = pd.to_numeric(Ms.get("Buy_$", 0), errors="coerce").fillna(0).sum()
@@ -1122,22 +1122,22 @@ with tab_overview:
             # figw = make_bill_waterfall(baseline, buy, sell, net)
             # st.plotly_chart(figw, use_container_width=True)
 
-    else:  # Annual
-        if Mf is None or Mf.empty:
-            st.info("No monthly data to build annual billing.")
-        else:
-            Y = Mf.set_index("__ts__")[[c for c in ["Buy_$","Sell_$","NetBill_$"] if c in Mf.columns]].resample("YS").sum(min_count=1).reset_index()
-            Y["year"] = Y["__ts__"].dt.year
-            fig = px.bar(Y, x="year", y=[c for c in ["Buy_$","Sell_$","NetBill_$"] if c in Y.columns],
-                         barmode="group", title="Billing (Annual)")
-            st.plotly_chart(fig, use_container_width=True)
+    # else:  # Annual
+    #     if Mf is None or Mf.empty:
+    #         st.info("No monthly data to build annual billing.")
+    #     else:
+    #         Y = Mf.set_index("__ts__")[[c for c in ["Buy_$","Sell_$","NetBill_$"] if c in Mf.columns]].resample("YS").sum(min_count=1).reset_index()
+    #         Y["year"] = Y["__ts__"].dt.year
+    #         fig = px.bar(Y, x="year", y=[c for c in ["Buy_$","Sell_$","NetBill_$"] if c in Y.columns],
+    #                      barmode="group", title="Billing (Annual)")
+    #         st.plotly_chart(fig, use_container_width=True)
 
     # ==== IMPORT / EXPORT (moved here) =================================
     st.markdown("### Import vs Export")
     gran_ie = st.radio(
         "Granularity (Import/Export)",
-        ["Hourly", "Daily", "Monthly", "Annual"],
-        index=0,
+        ["Hourly", "Daily"], # "Monthly", "Annual"
+        index=1,
         horizontal=True,
         key="overview_imp_exp_granularity",
     )
@@ -1160,26 +1160,26 @@ with tab_overview:
             fig = px.area(daily, x="date", y=["Import_kWh", "Export_kWh"], title="Import/Export Energy (Daily kWh)")
             st.plotly_chart(fig, use_container_width=True)
 
-        elif gran_ie == "Monthly":
-            if Mf is not None and not Mf.empty and all(c in Mf.columns for c in ["Import_kWh", "Export_kWh"]):
-                Ms = Mf.copy()
-                Ms["month"] = Ms["__ts__"].dt.strftime("%Y-%m")
-                fig = px.area(Ms, x="month", y=["Import_kWh", "Export_kWh"], title="Import/Export Energy (Monthly kWh)")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                mon = Hf.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("MS").sum(min_count=1).reset_index()
-                mon["month"] = mon["__ts__"].dt.strftime("%Y-%m")
-                fig = px.area(mon, x="month", y=["Import_kWh", "Export_kWh"], title="Import/Export Energy (Monthly kWh)")
-                st.plotly_chart(fig, use_container_width=True)
+        # elif gran_ie == "Monthly":
+        #     if Mf is not None and not Mf.empty and all(c in Mf.columns for c in ["Import_kWh", "Export_kWh"]):
+        #         Ms = Mf.copy()
+        #         Ms["month"] = Ms["__ts__"].dt.strftime("%Y-%m")
+        #         fig = px.area(Ms, x="month", y=["Import_kWh", "Export_kWh"], title="Import/Export Energy (Monthly kWh)")
+        #         st.plotly_chart(fig, use_container_width=True)
+        #     else:
+        #         mon = Hf.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("MS").sum(min_count=1).reset_index()
+        #         mon["month"] = mon["__ts__"].dt.strftime("%Y-%m")
+        #         fig = px.area(mon, x="month", y=["Import_kWh", "Export_kWh"], title="Import/Export Energy (Monthly kWh)")
+        #         st.plotly_chart(fig, use_container_width=True)
 
-        else:  # Annual
-            if Mf is not None and not Mf.empty and all(c in Mf.columns for c in ["Import_kWh", "Export_kWh"]):
-                Y = Mf.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("YS").sum(min_count=1).reset_index()
-            else:
-                Y = Hf.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("YS").sum(min_count=1).reset_index()
-            Y["year"] = Y["__ts__"].dt.year
-            fig = px.bar(Y, x="year", y=["Import_kWh", "Export_kWh"], barmode="group", title="Import/Export Energy (Annual kWh)")
-            st.plotly_chart(fig, use_container_width=True)
+        # else:  # Annual
+        #     if Mf is not None and not Mf.empty and all(c in Mf.columns for c in ["Import_kWh", "Export_kWh"]):
+        #         Y = Mf.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("YS").sum(min_count=1).reset_index()
+        #     else:
+        #         Y = Hf.set_index("__ts__")[["Import_kWh", "Export_kWh"]].resample("YS").sum(min_count=1).reset_index()
+        #     Y["year"] = Y["__ts__"].dt.year
+        #     fig = px.bar(Y, x="year", y=["Import_kWh", "Export_kWh"], barmode="group", title="Import/Export Energy (Annual kWh)")
+        #     st.plotly_chart(fig, use_container_width=True)
 
 
 # -------------------- Map & Shading ---------------------

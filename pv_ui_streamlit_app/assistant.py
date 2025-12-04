@@ -73,9 +73,9 @@ def ask_ai(prompt: str) -> str:
 # 🤖 MAIN CHATBOT FUNCTION
 # --------------------------------------------------------------------
 def run_ai_chatbot():
-    st.set_page_config(page_title="⚡ Shady Data Chat Assistant", page_icon="🌞", layout="wide")
+    st.set_page_config(page_title="Solarity Data Chat Assistant", layout="wide")
  
-    st.title("⚡ Shady Data Chat Assistant")
+    st.title("Solarity Data Chat Assistant")
     st.caption("Chat with your solar datasets — ask questions and get visual or analytical answers instantly.")
  
     # ✅ Adjusted base directory (parent folder containing data folders)
@@ -85,15 +85,15 @@ def run_ai_chatbot():
     if not all_data:
         st.error(f"❌ No CSV files found under {base_dir}. Check your folder paths.")
         st.stop()
-    else:
-        st.success(f"✅ Loaded {len(all_data)} CSV files successfully from {base_dir}.")
+    # else:
+        # st.success(f"✅ Loaded {len(all_data)} CSV files successfully from {base_dir}.")
  
     # 🕒 Optional: show example time columns
     for name, df in all_data.items():
         for col in df.columns:
             if "time" in col.lower() or "date" in col.lower():
                 sample_val = df[col].dropna().astype(str).head(1).to_list()
-                st.write(f"🕒 {name} → Column: {col} → Example: {sample_val}")
+                # st.write(f"🕒 {name} → Column: {col} → Example: {sample_val}")
  
     # Store chat conversation
     if "messages" not in st.session_state:
@@ -315,7 +315,7 @@ def run_ai_chatbot():
  
                 if isinstance(fig, go.Figure):
                     st.plotly_chart(fig, use_container_width=True)
-                    st.caption("✅ AI-generated chart.")
+                    # st.caption("✅ AI-generated chart.")
                     st.session_state.messages.append(
                         {"role": "assistant", "content": "Chart rendered.", "chart": fig}
                     )
